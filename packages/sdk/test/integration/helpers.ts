@@ -167,7 +167,10 @@ export async function waitForObjectPresent(
       },
     );
     if (response.ok) {
-      return;
+      const object = (await response.json()) as { id?: unknown } | null;
+      if (object?.id === id) {
+        return;
+      }
     }
     await sleep(250);
   }

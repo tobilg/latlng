@@ -109,6 +109,12 @@ jobs:
           toolchain: 1.94.0
           targets: wasm32-unknown-unknown
 
+      - name: Install wasm-opt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binaryen
+          wasm-opt --version
+
       - name: Install browser wasm package dependencies
         run: make wasm-install
 
@@ -401,6 +407,12 @@ jobs:
         with:
           toolchain: 1.94.0
           targets: wasm32-unknown-unknown
+
+      - name: Install wasm-opt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binaryen
+          wasm-opt --version
 
       - name: Determine release mode
         id: release_mode

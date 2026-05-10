@@ -254,6 +254,8 @@ console.log(info.version, info.num_collections, info.num_objects);
 - The wasm state is in-memory inside the worker and is lost when the worker is terminated or the page reloads.
 - Serve `.wasm` files with `application/wasm` for fastest startup. The fallback still works but is slower.
 - Bundlers must preserve the emitted worker asset and make `latlng_core_bg.wasm` available to the worker.
+- Package builds run `wasm-opt -Oz` through Binaryen after `wasm-bindgen`; install
+  Binaryen locally before running `npm run build` or `npm run test`.
 
 ## Bundling
 

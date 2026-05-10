@@ -1,10 +1,20 @@
-import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  existsSync,
+  mkdirSync,
+  readFileSync,
+  renameSync,
+  rmSync,
+  statSync,
+  writeFileSync,
+} from "node:fs";
 import { resolve } from "node:path";
 import { spawnSync } from "node:child_process";
 
 const packageRoot = process.cwd();
 const repoRoot = resolve(packageRoot, "..", "..");
 const outDir = resolve(packageRoot, "pkg");
+const wasmOutput = resolve(outDir, "latlng_core_bg.wasm");
+const optimizedWasmOutput = resolve(outDir, "latlng_core_bg.opt.wasm");
 const wasmInput = resolve(
   repoRoot,
   "target",
@@ -41,6 +51,14 @@ run("wasm-bindgen", [
   wasmInput,
 ], packageRoot);
 
+const beforeBytes = statSync(wasmOutput).size;
+run("wasm-opt", ["-Oz", wasmOutput, "-o", optimizedWasmOutput], packageRoot);
+renameSync(optimizedWasmOutput, wasmOutput);
+const afterBytes = statSync(wasmOutput).size;
+console.log(
+  `wasm-opt -Oz reduced latlng_core_bg.wasm from ${formatBytes(beforeBytes)} to ${formatBytes(afterBytes)}`,
+);
+
 const generatedJs = resolve(outDir, "latlng_core.js");
 const source = readFileSync(generatedJs, "utf8");
 writeFileSync(
@@ -50,6 +68,10 @@ writeFileSync(
     "        throw new Error('latlng wasm initialization requires an explicit wasm URL');\n",
   ),
 );
+
+function formatBytes(bytes: number): string {
+  return `${(bytes / 1024).toFixed(1)} KiB`;
+}
 
 function run(command: string, args: string[], cwd: string): void {
   const result = spawnSync(command, args, {

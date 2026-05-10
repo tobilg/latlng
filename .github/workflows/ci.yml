@@ -139,11 +139,16 @@ jobs:
           name: latlng-binaries-linux-x64
           path: .ci-artifacts/linux-x64
 
-      - name: Prepare Linux server binary for Docker build
-        run: chmod +x .ci-artifacts/linux-x64/bin/latlng-server
+      - name: Extract Linux server release artifact
+        run: |
+          archive="$(find .ci-artifacts/linux-x64 -name latlng-linux-x64.tar.gz -print -quit)"
+          test -n "$archive"
+          mkdir -p .ci-artifacts/linux-x64/extracted
+          tar -xzf "$archive" -C .ci-artifacts/linux-x64/extracted
+          chmod +x .ci-artifacts/linux-x64/extracted/latlng-server
 
       - name: Build latlng Docker image
-        run: make docker-build-prebuilt LATLNG_SERVER_BINARY=.ci-artifacts/linux-x64/bin/latlng-server DOCKER_PREBUILT_IMAGE=latlng-server:ci
+        run: make docker-build-prebuilt LATLNG_SERVER_BINARY=.ci-artifacts/linux-x64/extracted/latlng-server DOCKER_PREBUILT_IMAGE=latlng-server:ci
 
   typescript-sdk:
     needs: rust
@@ -210,6 +215,12 @@ jobs:
         with:
           toolchain: 1.94.0
           targets: wasm32-unknown-unknown
+
+      - name: Install wasm-opt
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y binaryen
+          wasm-opt --version
 
       - name: Install browser wasm package dependencies
         run: make wasm-install
