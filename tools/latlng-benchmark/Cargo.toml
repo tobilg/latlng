@@ -1,0 +1,22 @@
+[package]
+name = "latlng-benchmark"
+description = "Benchmark tooling for latlng."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+axum.workspace = true
+latlng-core = { path = "../../crates/latlng-core", features = ["parallel"] }
+latlng-endpoints = { path = "../../crates/latlng-endpoints" }
+latlng-platform = { path = "../../crates/latlng-platform" }
+latlng-storage-memory = { path = "../../crates/latlng-storage-memory" }
+reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true

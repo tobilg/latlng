@@ -1,0 +1,34 @@
+services:
+  latlng-leader:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: latlng-server:dev
+    container_name: latlng-leader
+    ports:
+      - "7421:7421"
+      - "7422:7422"
+    volumes:
+      - ./examples/docker/leader.toml:/etc/latlng/latlng.toml:ro
+      - latlng-leader-data:/var/lib/latlng
+    restart: unless-stopped
+
+  latlng-follower:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: latlng-server:dev
+    container_name: latlng-follower
+    depends_on:
+      - latlng-leader
+    ports:
+      - "17421:7421"
+      - "17422:7422"
+    volumes:
+      - ./examples/docker/follower.toml:/etc/latlng/latlng.toml:ro
+      - latlng-follower-data:/var/lib/latlng
+    restart: unless-stopped
+
+volumes:
+  latlng-leader-data:
+  latlng-follower-data:

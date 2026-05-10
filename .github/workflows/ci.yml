@@ -1,0 +1,192 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+          components: clippy,rustfmt
+          targets: wasm32-unknown-unknown
+
+      - name: Cargo fmt
+        run: make fmt-check
+
+      - name: Cargo clippy
+        run: make clippy
+
+      - name: Cargo test
+        run: make test
+
+      - name: Portable wasm check
+        run: make check-wasm
+
+      - name: Generate static OpenAPI
+        run: make openapi
+
+  binaries:
+    name: binaries-${{ matrix.artifact_suffix }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_suffix: linux-x64
+            binary_ext: ""
+          - os: macos-latest
+            artifact_suffix: macos-arm64
+            binary_ext: ""
+          - os: windows-latest
+            artifact_suffix: windows-x64
+            binary_ext: ".exe"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+
+      - name: Build release server and CLI binaries (Unix)
+        if: runner.os != 'Windows'
+        run: make build-server-release build-cli-release
+
+      - name: Build release server and CLI binaries (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release -p latlng-server -p latlng-cli
+
+      - name: Package release binaries (Unix)
+        if: runner.os != 'Windows'
+        run: make package-release-binaries ARTIFACT_SUFFIX=${{ matrix.artifact_suffix }} BINARY_EXT=${{ matrix.binary_ext }}
+
+      - name: Verify release archive excludes benchmark binaries (Unix)
+        if: runner.os != 'Windows'
+        run: make verify-release-binaries ARTIFACT_SUFFIX=${{ matrix.artifact_suffix }} BINARY_EXT=${{ matrix.binary_ext }}
+
+      - name: Package release binaries (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p "dist/${{ matrix.artifact_suffix }}/bin"
+          cp "target/release/latlng-server${{ matrix.binary_ext }}" "dist/${{ matrix.artifact_suffix }}/bin/latlng-server${{ matrix.binary_ext }}"
+          cp "target/release/latlng-cli${{ matrix.binary_ext }}" "dist/${{ matrix.artifact_suffix }}/bin/latlng-cli${{ matrix.binary_ext }}"
+          tar -czf "dist/latlng-${{ matrix.artifact_suffix }}.tar.gz" -C "dist/${{ matrix.artifact_suffix }}/bin" .
+
+      - name: Verify release archive excludes benchmark binaries (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          entries="$(tar -tzf "dist/latlng-${{ matrix.artifact_suffix }}.tar.gz" | sed 's#^\./##' | grep -v '^$' | grep -v '/$' | sort | tr '\n' ' ')"
+          expected="latlng-cli${{ matrix.binary_ext }} latlng-server${{ matrix.binary_ext }} "
+          test "$entries" = "$expected"
+
+      - name: Upload server/CLI artifacts
+        uses: actions/upload-artifact@v6
+        with:
+          name: latlng-binaries-${{ matrix.artifact_suffix }}
+          path: |
+            dist/${{ matrix.artifact_suffix }}/bin
+            dist/latlng-${{ matrix.artifact_suffix }}.tar.gz
+
+  docker:
+    needs: binaries
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Download Linux release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: latlng-binaries-linux-x64
+          path: .ci-artifacts/linux-x64
+
+      - name: Prepare Linux server binary for Docker build
+        run: chmod +x .ci-artifacts/linux-x64/bin/latlng-server
+
+      - name: Build latlng Docker image
+        run: make docker-build-prebuilt LATLNG_SERVER_BINARY=.ci-artifacts/linux-x64/bin/latlng-server DOCKER_PREBUILT_IMAGE=latlng-server:ci
+
+  typescript-sdk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: packages/sdk/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+
+      - name: Install TypeScript SDK dependencies
+        run: make sdk-install
+
+      - name: Build latlng-server binary
+        run: make build-server
+
+      - name: Build TypeScript SDK
+        run: make sdk-build
+
+      - name: Typecheck TypeScript SDK
+        run: make sdk-typecheck
+
+      - name: Generate TypeScript SDK API docs
+        run: make sdk-docs
+
+      - name: Validate TypeScript SDK package contents
+        working-directory: packages/sdk
+        run: npm pack --dry-run
+
+      - name: Test TypeScript SDK unit suite
+        run: make sdk-test-unit
+
+      - name: Test TypeScript SDK integration suite
+        run: make sdk-test-integration
+
+  typescript-wasm:
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: packages/wasm/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+          targets: wasm32-unknown-unknown
+
+      - name: Install browser wasm package dependencies
+        run: make wasm-install
+
+      - name: Build browser wasm package
+        run: make wasm-build
+
+      - name: Typecheck browser wasm package
+        run: make wasm-typecheck
+
+      - name: Test browser wasm package
+        run: make wasm-test
+
+      - name: Validate browser wasm package contents
+        run: make wasm-pack-dry-run

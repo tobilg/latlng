@@ -1,0 +1,24 @@
+[package]
+name = "latlng-endpoints"
+description = "Webhook endpoint integrations for latlng."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+latlng-geofence = { path = "../latlng-geofence" }
+reqwest.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+axum.workspace = true
+latlng-geo = { path = "../latlng-geo" }
+
+[lints]
+workspace = true

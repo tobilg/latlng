@@ -1,0 +1,55 @@
+[package]
+name = "latlng-server"
+description = "Native server binary for latlng."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+axum.workspace = true
+bincode.workspace = true
+capnp.workspace = true
+capnp-rpc.workspace = true
+latlng-auth = { path = "../latlng-auth" }
+latlng-capnp = { path = "../latlng-capnp" }
+latlng-config = { path = "../latlng-config" }
+latlng-core = { path = "../latlng-core" }
+latlng-endpoints = { path = "../latlng-endpoints" }
+latlng-geofence = { path = "../latlng-geofence" }
+latlng-http = { path = "../latlng-http" }
+latlng-native-executor = { path = "../latlng-native-executor" }
+latlng-storage-aof = { path = "../latlng-storage-aof" }
+latlng-storage-memory = { path = "../latlng-storage-memory" }
+latlng-webhook-queue = { path = "../latlng-webhook-queue" }
+latlng-replication = { path = "../latlng-replication" }
+latlng-ws = { path = "../latlng-ws" }
+reqwest.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tokio-util = { version = "0.7.16", features = ["compat"] }
+tracing.workspace = true
+tracing-appender.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+capnp.workspace = true
+capnp-rpc.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde_json.workspace = true
+tempfile = "3.23.0"
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tokio-util = { version = "0.7.16", features = ["compat"] }
+
+[features]
+default = ["native-server", "parallel"]
+native-server = []
+parallel = ["latlng-core/parallel"]
+
+[lints]
+workspace = true

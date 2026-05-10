@@ -1,0 +1,13 @@
+listen_addr = "0.0.0.0:7421"
+capnp_enabled = true
+capnp_listen_addr = "0.0.0.0:7422"
+server_id = "docker-single"
+webhook_queue_path = "/var/lib/latlng/webhook-queue.sqlite"
+bearer_token = "dev-token"
+aof_writer_queue_limit = 4096
+aof_group_commit_delay_ms = 1
+aof_group_commit_max_requests = 128
+
+[storage]
+type = "aof"
+path = "/var/lib/latlng/appendonly.aof"

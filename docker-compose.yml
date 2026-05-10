@@ -1,0 +1,16 @@
+services:
+  latlng:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: latlng-server:dev
+    ports:
+      - "7421:7421"
+      - "7422:7422"
+    volumes:
+      - ./examples/docker/single-node.toml:/etc/latlng/latlng.toml:ro
+      - latlng-data:/var/lib/latlng
+    restart: unless-stopped
+
+volumes:
+  latlng-data:

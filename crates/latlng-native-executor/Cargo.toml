@@ -1,0 +1,21 @@
+[package]
+name = "latlng-native-executor"
+description = "Native bounded executor for synchronous latlng core calls."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+crossbeam-channel.workspace = true
+latlng-core = { path = "../latlng-core" }
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+latlng-storage-memory = { path = "../latlng-storage-memory" }
+
+[lints]
+workspace = true

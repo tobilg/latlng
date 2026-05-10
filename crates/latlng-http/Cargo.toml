@@ -1,0 +1,36 @@
+[package]
+name = "latlng-http"
+description = "HTTP transport crate for latlng."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+axum.workspace = true
+http.workspace = true
+latlng-auth = { path = "../latlng-auth" }
+latlng-config = { path = "../latlng-config" }
+latlng-core = { path = "../latlng-core" }
+latlng-geofence = { path = "../latlng-geofence" }
+latlng-native-executor = { path = "../latlng-native-executor" }
+latlng-replication = { path = "../latlng-replication" }
+latlng-webhook-queue = { path = "../latlng-webhook-queue" }
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tower-http.workspace = true
+tracing.workspace = true
+utoipa.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+jsonwebtoken.workspace = true
+latlng-storage-memory = { path = "../latlng-storage-memory" }
+tower.workspace = true
+
+[lints]
+workspace = true

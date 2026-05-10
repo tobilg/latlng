@@ -1,0 +1,22 @@
+[package]
+name = "latlng-webhook-queue"
+description = "Durable SQLite-backed webhook queue for latlng."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+latlng-core = { path = "../latlng-core" }
+latlng-geofence = { path = "../latlng-geofence" }
+rusqlite.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+tempfile = "3.23.0"
+
+[lints]
+workspace = true

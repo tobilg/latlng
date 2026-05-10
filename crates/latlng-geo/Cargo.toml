@@ -1,0 +1,22 @@
+[package]
+name = "latlng-geo"
+description = "Geometry and object model foundations for latlng."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+geo.workspace = true
+geo-types.workspace = true
+geojson.workspace = true
+regex.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+url.workspace = true

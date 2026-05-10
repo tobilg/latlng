@@ -1,0 +1,310 @@
+name: release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write
+
+jobs:
+  binaries:
+    name: release-binaries-${{ matrix.artifact_suffix }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            artifact_suffix: linux-x64
+            binary_ext: ""
+          - os: macos-latest
+            artifact_suffix: macos-arm64
+            binary_ext: ""
+          - os: windows-latest
+            artifact_suffix: windows-x64
+            binary_ext: ".exe"
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+
+      - name: Build release server and CLI binaries (Unix)
+        if: runner.os != 'Windows'
+        run: make build-server-release build-cli-release
+
+      - name: Build release server and CLI binaries (Windows)
+        if: runner.os == 'Windows'
+        run: cargo build --release -p latlng-server -p latlng-cli
+
+      - name: Package release binaries (Unix)
+        if: runner.os != 'Windows'
+        run: make package-release-binaries ARTIFACT_SUFFIX=${{ matrix.artifact_suffix }} BINARY_EXT=${{ matrix.binary_ext }}
+
+      - name: Verify release archive excludes benchmark binaries (Unix)
+        if: runner.os != 'Windows'
+        run: make verify-release-binaries ARTIFACT_SUFFIX=${{ matrix.artifact_suffix }} BINARY_EXT=${{ matrix.binary_ext }}
+
+      - name: Package release binaries (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          mkdir -p "dist/${{ matrix.artifact_suffix }}/bin"
+          cp "target/release/latlng-server${{ matrix.binary_ext }}" "dist/${{ matrix.artifact_suffix }}/bin/latlng-server${{ matrix.binary_ext }}"
+          cp "target/release/latlng-cli${{ matrix.binary_ext }}" "dist/${{ matrix.artifact_suffix }}/bin/latlng-cli${{ matrix.binary_ext }}"
+          tar -czf "dist/latlng-${{ matrix.artifact_suffix }}.tar.gz" -C "dist/${{ matrix.artifact_suffix }}/bin" .
+
+      - name: Verify release archive excludes benchmark binaries (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          entries="$(tar -tzf "dist/latlng-${{ matrix.artifact_suffix }}.tar.gz" | sed 's#^\./##' | grep -v '^$' | grep -v '/$' | sort | tr '\n' ' ')"
+          expected="latlng-cli${{ matrix.binary_ext }} latlng-server${{ matrix.binary_ext }} "
+          test "$entries" = "$expected"
+
+      - name: Upload packaged release binaries
+        uses: actions/upload-artifact@v6
+        with:
+          name: latlng-release-${{ matrix.artifact_suffix }}
+          path: dist/latlng-${{ matrix.artifact_suffix }}.tar.gz
+
+  github-release:
+    needs: binaries
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref_name, 'v')
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+
+      - name: Determine release mode
+        id: release_mode
+        shell: bash
+        run: |
+          if [ "${ACT:-}" = "true" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download packaged release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: latlng-release-*
+          path: dist/release-assets
+          merge-multiple: true
+
+      - name: Generate static OpenAPI release artifact
+        run: make openapi OPENAPI_OUTPUT=dist/release-assets/openapi.json
+
+      - name: Inspect release assets (dry run)
+        if: steps.release_mode.outputs.publish != 'true'
+        run: ls -lah dist/release-assets
+
+      - name: Generate release checksums
+        shell: bash
+        run: |
+          cd dist/release-assets
+          shasum -a 256 *.tar.gz openapi.json > SHA256SUMS
+
+      - name: Publish GitHub release assets
+        if: steps.release_mode.outputs.publish == 'true'
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/release-assets/*.tar.gz
+            dist/release-assets/openapi.json
+            dist/release-assets/SHA256SUMS
+
+  container-release:
+    needs: binaries
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref_name, 'v')
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Determine release mode
+        id: release_mode
+        shell: bash
+        run: |
+          if [ "${ACT:-}" = "true" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download Linux release artifacts
+        uses: actions/download-artifact@v8
+        with:
+          name: latlng-release-linux-x64
+          path: .ci-artifacts/linux-x64
+
+      - name: Extract Linux server release artifact
+        run: |
+          mkdir -p .ci-artifacts/linux-x64/extracted
+          tar -xzf .ci-artifacts/linux-x64/latlng-linux-x64.tar.gz -C .ci-artifacts/linux-x64/extracted
+          chmod +x .ci-artifacts/linux-x64/extracted/latlng-server
+
+      - name: Log in to Docker Hub
+        if: steps.release_mode.outputs.publish == 'true'
+        uses: docker/login-action@v3
+        with:
+          username: tobilg
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Extract container metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: tobilg/latlng
+          tags: |
+            type=raw,value=${{ github.ref_name }}
+
+      - name: Build and publish container image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./Dockerfile
+          target: runtime-prebuilt
+          push: ${{ steps.release_mode.outputs.publish == 'true' }}
+          load: ${{ steps.release_mode.outputs.publish != 'true' }}
+          build-args: |
+            LATLNG_SERVER_BINARY=.ci-artifacts/linux-x64/extracted/latlng-server
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+
+  sdk-release:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref_name, 'v')
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: packages/sdk/package-lock.json
+
+      - name: Determine release mode
+        id: release_mode
+        shell: bash
+        run: |
+          if [ "${ACT:-}" = "true" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install TypeScript SDK dependencies
+        run: make sdk-install
+
+      - name: Build TypeScript SDK
+        run: make sdk-build
+
+      - name: Typecheck TypeScript SDK
+        run: make sdk-typecheck
+
+      - name: Test TypeScript SDK unit suite
+        run: make sdk-test-unit
+
+      - name: Verify SDK package version matches tag
+        working-directory: packages/sdk
+        shell: bash
+        run: |
+          PACKAGE_VERSION="$(npm pkg get version | tr -d '"')"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          test "$PACKAGE_VERSION" = "$TAG_VERSION"
+
+      - name: Pack TypeScript SDK
+        working-directory: packages/sdk
+        run: npm pack
+
+      - name: Upload TypeScript SDK package artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: latlng-sdk-npm-package
+          path: packages/sdk/latlng-sdk-*.tgz
+
+      - name: Publish TypeScript SDK to npm
+        if: steps.release_mode.outputs.publish == 'true'
+        working-directory: packages/sdk
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public
+
+  wasm-release:
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref_name, 'v')
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+          cache: npm
+          cache-dependency-path: packages/wasm/package-lock.json
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: 1.94.0
+          targets: wasm32-unknown-unknown
+
+      - name: Determine release mode
+        id: release_mode
+        shell: bash
+        run: |
+          if [ "${ACT:-}" = "true" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Install browser wasm package dependencies
+        run: make wasm-install
+
+      - name: Build browser wasm package
+        run: make wasm-build
+
+      - name: Typecheck browser wasm package
+        run: make wasm-typecheck
+
+      - name: Test browser wasm package
+        run: make wasm-test
+
+      - name: Verify browser wasm package version matches tag
+        working-directory: packages/wasm
+        shell: bash
+        run: |
+          PACKAGE_VERSION="$(npm pkg get version | tr -d '"')"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          test "$PACKAGE_VERSION" = "$TAG_VERSION"
+
+      - name: Pack browser wasm package
+        working-directory: packages/wasm
+        run: npm pack
+
+      - name: Upload browser wasm npm package artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: latlng-wasm-npm-package
+          path: packages/wasm/latlng-wasm-*.tgz
+
+      - name: Publish browser wasm package to npm
+        if: steps.release_mode.outputs.publish == 'true'
+        working-directory: packages/wasm
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish --provenance --access public

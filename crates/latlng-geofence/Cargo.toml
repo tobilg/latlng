@@ -1,0 +1,23 @@
+[package]
+name = "latlng-geofence"
+description = "Geofencing primitives for latlng."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+geo.workspace = true
+geo-types.workspace = true
+glob-match.workspace = true
+hashbrown.workspace = true
+latlng-geo = { path = "../latlng-geo" }
+latlng-index = { path = "../latlng-index" }
+latlng-platform = { path = "../latlng-platform" }
+serde.workspace = true
+thiserror.workspace = true
+
+[lints]
+workspace = true

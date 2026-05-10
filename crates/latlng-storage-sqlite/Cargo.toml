@@ -1,0 +1,21 @@
+[package]
+name = "latlng-storage-sqlite"
+description = "SQLite storage backend for latlng."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+bincode.workspace = true
+latlng-storage = { path = "../latlng-storage" }
+rusqlite.workspace = true
+
+[dev-dependencies]
+bytes.workspace = true
+tempfile = "3.23.0"
+
+[lints]
+workspace = true

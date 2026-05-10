@@ -1,0 +1,35 @@
+[package]
+name = "latlng-capnp"
+description = "Cap'n Proto transport crate for latlng."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+capnp.workspace = true
+capnp-rpc.workspace = true
+latlng-auth = { path = "../latlng-auth" }
+latlng-config = { path = "../latlng-config" }
+latlng-core = { path = "../latlng-core" }
+latlng-native-executor = { path = "../latlng-native-executor" }
+latlng-replication = { path = "../latlng-replication" }
+latlng-schema = { path = "../latlng-schema" }
+bincode.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-util = { version = "0.7.16", features = ["compat"] }
+futures-util.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+jsonwebtoken.workspace = true
+latlng-storage-memory = { path = "../latlng-storage-memory" }
+
+[lints]
+workspace = true

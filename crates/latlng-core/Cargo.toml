@@ -1,0 +1,49 @@
+[package]
+name = "latlng-core"
+description = "Protocol-agnostic engine core for latlng."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lib]
+crate-type = ["rlib", "cdylib"]
+
+[dependencies]
+base64 = "0.22.1"
+bytes.workspace = true
+bincode.workspace = true
+hashbrown.workspace = true
+md5.workspace = true
+latlng-geo = { path = "../latlng-geo" }
+latlng-geofence = { path = "../latlng-geofence" }
+latlng-index = { path = "../latlng-index" }
+latlng-platform = { path = "../latlng-platform" }
+latlng-storage = { path = "../latlng-storage" }
+glob-match.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+js-sys.workspace = true
+serde-wasm-bindgen = { workspace = true, optional = true }
+wasm-bindgen = { workspace = true, optional = true }
+
+[features]
+default = []
+parallel = ["latlng-index/parallel"]
+wasm-bindings = ["dep:serde-wasm-bindgen", "dep:wasm-bindgen", "dep:latlng-storage-memory"]
+wasm-browser-bindings = ["dep:serde-wasm-bindgen", "dep:wasm-bindgen", "dep:latlng-storage-memory"]
+
+[dev-dependencies]
+latlng-storage-aof = { path = "../latlng-storage-aof" }
+latlng-storage-memory = { path = "../latlng-storage-memory" }
+tempfile = "3.23.0"
+
+[dependencies.latlng-storage-memory]
+path = "../latlng-storage-memory"
+optional = true
+
+[lints]
+workspace = true

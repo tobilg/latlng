@@ -1,0 +1,29 @@
+[package]
+name = "latlng-index"
+description = "Spatial indexing crate for latlng."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[features]
+default = []
+parallel = ["dep:rayon"]
+
+[dependencies]
+latlng-geo = { path = "../latlng-geo" }
+glob-match.workspace = true
+rayon = { workspace = true, optional = true }
+regex.workspace = true
+rstar.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+
+[dev-dependencies]
+proptest = "1.9.0"
+
+[lints]
+workspace = true

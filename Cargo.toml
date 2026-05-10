@@ -1,0 +1,95 @@
+[workspace]
+members = [
+    "crates/latlng-auth",
+    "crates/latlng-config",
+    "crates/latlng-platform",
+    "crates/latlng-geo",
+    "crates/latlng-index",
+    "crates/latlng-storage",
+    "crates/latlng-core",
+    "crates/latlng-geofence",
+    "crates/latlng-storage-aof",
+    "crates/latlng-storage-sqlite",
+    "crates/latlng-storage-memory",
+    "crates/latlng-webhook-queue",
+    "crates/latlng-schema",
+    "crates/latlng-capnp",
+    "crates/latlng-http",
+    "crates/latlng-ws",
+    "crates/latlng-endpoints",
+    "crates/latlng-replication",
+    "crates/latlng-native-executor",
+    "crates/latlng-server",
+    "tools/latlng-cli",
+    "tools/latlng-benchmark",
+    "tools/latlng-server-benchmark",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/tobilg/latlng"
+rust-version = "1.94"
+version = "0.1.0"
+
+[workspace.dependencies]
+async-trait = "0.1.89"
+axum = { version = "0.8.6", features = ["json", "macros", "ws"] }
+bincode = "1.3.3"
+bytes = { version = "1.10.1", features = ["serde"] }
+capnp = "0.23.0"
+capnp-rpc = "0.23.0"
+capnpc = "0.23.2"
+chrono = { version = "0.4.42", features = ["clock", "serde"] }
+clap = { version = "4.5.53", features = ["derive", "env"] }
+crossbeam-channel = "0.5.15"
+futures = "0.3.31"
+futures-util = "0.3.31"
+geo = { version = "0.31.0", features = ["use-serde"] }
+geo-types = { version = "0.7.17", features = ["serde"] }
+geojson = { version = "0.24.2", features = ["geo-types"] }
+geohash = "0.13.1"
+glob-match = "0.2.1"
+hashbrown = { version = "0.16.0", features = ["serde"] }
+http = "1.3.1"
+js-sys = "=0.3.83"
+jsonwebtoken = { version = "10.0.0", features = ["rust_crypto"] }
+md5 = "0.8.0"
+regex = "1.12.2"
+reqwest = { version = "0.12.24", default-features = false, features = ["json", "rustls-tls"] }
+rayon = "1.11.0"
+rstar = "0.12.2"
+rusqlite = { version = "0.37.0", features = ["bundled"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.145"
+serde-wasm-bindgen = "0.6.5"
+sha2 = "0.10.9"
+spin = "0.10.0"
+thiserror = "2.0.17"
+toml = "0.9.8"
+tokio = { version = "1.48.0", features = ["fs", "io-util", "macros", "net", "process", "rt-multi-thread", "signal", "sync", "time"] }
+tower = "0.5.2"
+tower-http = { version = "0.6.6", features = ["cors", "limit"] }
+tracing = "0.1.41"
+tracing-appender = "0.2.3"
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt", "json"] }
+tokio-tungstenite = { version = "0.28.0", features = ["rustls-tls-webpki-roots"] }
+url = { version = "2.5.7", features = ["serde"] }
+utoipa = { version = "5.4.0", features = ["macros"] }
+uuid = { version = "1.18.1", features = ["serde", "v4"] }
+wasm-bindgen = "=0.2.106"
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+dbg_macro = "deny"
+todo = "deny"
+
+[profile.dev]
+debug = 1
+
+[profile.release]
+codegen-units = 1
+lto = "thin"

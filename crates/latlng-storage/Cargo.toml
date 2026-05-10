@@ -1,0 +1,18 @@
+[package]
+name = "latlng-storage"
+description = "Storage traits and shared contracts for latlng."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+publish = false
+
+[lints]
+workspace = true
+
+[dependencies]
+bytes.workspace = true
+md5.workspace = true
+serde.workspace = true
+thiserror.workspace = true
