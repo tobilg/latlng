@@ -34,6 +34,26 @@ jobs:
         with:
           toolchain: 1.94.0
 
+      - name: Install Cap'n Proto compiler (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y capnproto
+          capnp --version
+
+      - name: Install Cap'n Proto compiler (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install capnp
+          capnp --version
+
+      - name: Install Cap'n Proto compiler (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install capnproto -y
+          capnp --version
+
       - name: Build release server and CLI binaries (Unix)
         if: runner.os != 'Windows'
         run: make build-server-release build-cli-release
@@ -84,6 +104,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.94.0
+
+      - name: Install Cap'n Proto compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y capnproto
+          capnp --version
 
       - name: Determine release mode
         id: release_mode
@@ -183,6 +209,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
 
   sdk-release:
+    needs: binaries
     runs-on: ubuntu-latest
     if: startsWith(github.ref_name, 'v')
 
@@ -244,6 +271,7 @@ jobs:
         run: npm publish --provenance --access public
 
   wasm-release:
+    needs: binaries
     runs-on: ubuntu-latest
     if: startsWith(github.ref_name, 'v')
 

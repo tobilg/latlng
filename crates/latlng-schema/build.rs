@@ -15,8 +15,11 @@ fn main() {
     let codegen_result = if capnp_available {
         generate_schema(&schema_path, &out_dir)
     } else {
-        Err("capnp compiler is unavailable".to_owned())
+        Err("capnp compiler is unavailable; install the Cap'n Proto compiler (`capnp`) before building latlng-schema".to_owned())
     };
+    if let Err(error) = &codegen_result {
+        panic!("failed to generate Cap'n Proto Rust schema: {error}");
+    }
 
     let generated = format!(
         "pub const CAPNP_BINARY_AVAILABLE: bool = {capnp_available};\n\

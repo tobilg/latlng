@@ -19,6 +19,12 @@ jobs:
           components: clippy,rustfmt
           targets: wasm32-unknown-unknown
 
+      - name: Install Cap'n Proto compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y capnproto
+          capnp --version
+
       - name: Cargo fmt
         run: make fmt-check
 
@@ -35,6 +41,7 @@ jobs:
         run: make openapi
 
   binaries:
+    needs: rust
     name: binaries-${{ matrix.artifact_suffix }}
     runs-on: ${{ matrix.os }}
     strategy:
@@ -57,6 +64,26 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.94.0
+
+      - name: Install Cap'n Proto compiler (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y capnproto
+          capnp --version
+
+      - name: Install Cap'n Proto compiler (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          brew install capnp
+          capnp --version
+
+      - name: Install Cap'n Proto compiler (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          choco install capnproto -y
+          capnp --version
 
       - name: Build release server and CLI binaries (Unix)
         if: runner.os != 'Windows'
@@ -119,6 +146,7 @@ jobs:
         run: make docker-build-prebuilt LATLNG_SERVER_BINARY=.ci-artifacts/linux-x64/bin/latlng-server DOCKER_PREBUILT_IMAGE=latlng-server:ci
 
   typescript-sdk:
+    needs: rust
     runs-on: ubuntu-latest
 
     steps:
@@ -133,6 +161,12 @@ jobs:
       - uses: dtolnay/rust-toolchain@master
         with:
           toolchain: 1.94.0
+
+      - name: Install Cap'n Proto compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y capnproto
+          capnp --version
 
       - name: Install TypeScript SDK dependencies
         run: make sdk-install
@@ -160,6 +194,7 @@ jobs:
         run: make sdk-test-integration
 
   typescript-wasm:
+    needs: rust
     runs-on: ubuntu-latest
 
     steps:
