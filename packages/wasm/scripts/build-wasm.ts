@@ -80,9 +80,22 @@ function run(command: string, args: string[], cwd: string): void {
     env: process.env,
   });
   if (result.error) {
-    throw result.error;
+    throw new Error(
+      `failed to run ${command}: ${result.error.message}${installHint(command)}`,
+      { cause: result.error },
+    );
   }
   if (result.status !== 0) {
     throw new Error(`${command} ${args.join(" ")} failed with ${result.status}`);
   }
+}
+
+function installHint(command: string): string {
+  if (command === "wasm-bindgen") {
+    return "\nInstall wasm-bindgen-cli 0.2.106 and ensure wasm-bindgen is on PATH.";
+  }
+  if (command === "wasm-opt") {
+    return "\nInstall Binaryen and ensure wasm-opt is on PATH.";
+  }
+  return "";
 }

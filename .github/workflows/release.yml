@@ -109,6 +109,11 @@ jobs:
           toolchain: 1.94.0
           targets: wasm32-unknown-unknown
 
+      - name: Install wasm-bindgen CLI
+        run: |
+          cargo install wasm-bindgen-cli --version 0.2.106 --locked
+          wasm-bindgen --version
+
       - name: Install wasm-opt
         run: |
           sudo apt-get update
@@ -407,6 +412,11 @@ jobs:
         with:
           toolchain: 1.94.0
           targets: wasm32-unknown-unknown
+
+      - name: Install wasm-bindgen CLI
+        run: |
+          cargo install wasm-bindgen-cli --version 0.2.106 --locked
+          wasm-bindgen --version
 
       - name: Install wasm-opt
         run: |
