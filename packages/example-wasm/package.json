@@ -1,0 +1,30 @@
+{
+  "name": "@latlng/example-wasm",
+  "version": "0.1.1",
+  "private": true,
+  "description": "Static Vite demo site for the @latlng/wasm browser package",
+  "type": "module",
+  "scripts": {
+    "predev": "npm run build:wasm",
+    "dev": "vite --host 127.0.0.1",
+    "build:wasm": "npm --prefix ../wasm run build",
+    "build": "npm run build:wasm && vite build",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "preview": "vite preview --host 127.0.0.1",
+    "pages:dev": "wrangler pages dev dist",
+    "deploy": "npm run build && wrangler pages deploy dist"
+  },
+  "dependencies": {
+    "@latlng/wasm": "file:../wasm",
+    "leaflet": "^1.9.4"
+  },
+  "devDependencies": {
+    "@types/leaflet": "^1.9.21",
+    "typescript": "^6.0.3",
+    "vite": "^8.0.11",
+    "wrangler": "^4.90.0"
+  },
+  "engines": {
+    "node": ">=22"
+  }
+}

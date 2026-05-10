@@ -3,6 +3,7 @@ import { defineConfig } from "vite";
 import { latlngWasmPlugin } from "./src/vite-plugin/index.js";
 
 export default defineConfig({
+  base: "./",
   plugins: [
     latlngWasmPlugin({
       wasmPath: resolve(__dirname, "pkg", "latlng_core_bg.wasm"),

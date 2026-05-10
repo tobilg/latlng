@@ -91,6 +91,7 @@ Configuration, persistence, and release notes live in [docs/config.md](docs/conf
 - `tools/latlng-server-benchmark`: black-box localhost benchmark harness for the real `latlng-server` process
 - `packages/sdk`: TypeScript SDK for the HTTP and WebSocket server surfaces
 - `packages/wasm`: public browser-only Web Worker package around the wasm core for demos and local in-browser geospatial workloads
+- `packages/example-wasm`: static Vite site showcasing `@latlng/wasm` for Cloudflare Pages
 
 ## Quickstart
 
@@ -646,4 +647,5 @@ cargo test -p latlng-server --test server_smoke
 cargo check --target wasm32-unknown-unknown -p latlng-core --features wasm-bindings
 cd packages/sdk && npm ci && npm run typecheck && npm run build && npm run docs:api && npm run test
 cd packages/wasm && npm ci && npm run typecheck && npm run build && npm run test
+cd packages/example-wasm && npm ci && npm run typecheck && npm run build
 ```

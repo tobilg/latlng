@@ -1428,7 +1428,7 @@ dependencies = [
 
 [[package]]
 name = "latlng-auth"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "glob-match",
@@ -1443,7 +1443,7 @@ dependencies = [
 
 [[package]]
 name = "latlng-benchmark"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "latlng-core",
@@ -1457,7 +1457,7 @@ dependencies = [
 
 [[package]]
 name = "latlng-capnp"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bincode",
  "capnp",
@@ -1482,7 +1482,7 @@ dependencies = [
 
 [[package]]
 name = "latlng-cli"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "clap",
  "latlng-config",
@@ -1495,7 +1495,7 @@ dependencies = [
 
 [[package]]
 name = "latlng-config"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "latlng-auth",
  "serde",
@@ -1508,7 +1508,7 @@ dependencies = [
 
 [[package]]
 name = "latlng-core"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "base64",
  "bincode",
@@ -1534,7 +1534,7 @@ dependencies = [
 
 [[package]]
 name = "latlng-endpoints"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "latlng-geo",
@@ -1548,7 +1548,7 @@ dependencies = [
 
 [[package]]
 name = "latlng-geo"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "geo",
  "geo-types",
@@ -1562,7 +1562,7 @@ dependencies = [
 
 [[package]]
 name = "latlng-geofence"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "geo",
  "geo-types",
@@ -1577,7 +1577,7 @@ dependencies = [
 
 [[package]]
 name = "latlng-http"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "http",
@@ -1603,7 +1603,7 @@ dependencies = [
 
 [[package]]
 name = "latlng-index"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "glob-match",
  "latlng-geo",
@@ -1618,7 +1618,7 @@ dependencies = [
 
 [[package]]
 name = "latlng-native-executor"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "crossbeam-channel",
  "latlng-core",
@@ -1629,11 +1629,11 @@ dependencies = [
 
 [[package]]
 name = "latlng-platform"
-version = "0.1.0"
+version = "0.1.1"
 
 [[package]]
 name = "latlng-replication"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "latlng-storage",
  "serde",
@@ -1641,7 +1641,7 @@ dependencies = [
 
 [[package]]
 name = "latlng-schema"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "capnp",
  "capnpc",
@@ -1649,7 +1649,7 @@ dependencies = [
 
 [[package]]
 name = "latlng-server"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "bincode",
@@ -1683,7 +1683,7 @@ dependencies = [
 
 [[package]]
 name = "latlng-server-benchmark"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "capnp",
  "capnp-rpc",
@@ -1701,7 +1701,7 @@ dependencies = [
 
 [[package]]
 name = "latlng-storage"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "md5",
@@ -1711,7 +1711,7 @@ dependencies = [
 
 [[package]]
 name = "latlng-storage-aof"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bincode",
  "bytes",
@@ -1723,7 +1723,7 @@ dependencies = [
 
 [[package]]
 name = "latlng-storage-memory"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytes",
  "latlng-storage",
@@ -1732,7 +1732,7 @@ dependencies = [
 
 [[package]]
 name = "latlng-storage-sqlite"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bincode",
  "bytes",
@@ -1743,7 +1743,7 @@ dependencies = [
 
 [[package]]
 name = "latlng-webhook-queue"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "latlng-core",
  "latlng-geofence",
@@ -1755,7 +1755,7 @@ dependencies = [
 
 [[package]]
 name = "latlng-ws"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "axum",
  "futures-util",

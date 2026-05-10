@@ -26,6 +26,7 @@ COMPARE_TILE38_OUTPUT ?= $(BENCHMARK_RESULTS_DIR)/bench-server-compare-tile38.js
 
 SDK_DIR ?= packages/sdk
 WASM_DIR ?= packages/wasm
+EXAMPLE_WASM_DIR ?= packages/example-wasm
 
 ACT ?= act
 ACT_ARCH ?= linux/amd64
@@ -38,6 +39,7 @@ ACT_RELEASE_EVENT ?= .github/act/release-tag-push.json
 	bench-server bench-server-capnp bench-server-aof bench-server-tile38 bench-server-write-heavy bench-server-aof-tuning bench-server-query-heavy bench-server-geofence-heavy bench-server-compare bench-server-compare-capnp bench-server-compare-tile38 \
 		sdk-install sdk-build sdk-docs sdk-typecheck sdk-test-unit sdk-test-integration sdk-test \
 	wasm-install wasm-build wasm-typecheck wasm-test wasm-pack-dry-run \
+	example-wasm-install example-wasm-build example-wasm-typecheck example-wasm-preview example-wasm-deploy \
 	bump-version \
 		docker-build docker-build-prebuilt docker-build-prebuilt-local docker-up docker-down docker-up-replication docker-down-replication \
 	act-ci act-ci-rust act-ci-sdk act-ci-wasm act-ci-docker act-release act-release-binaries act-release-github act-release-container
@@ -90,8 +92,15 @@ help:
 	'  make wasm-test            # npm run test in packages/wasm' \
 	'  make wasm-pack-dry-run    # npm pack --dry-run in packages/wasm' \
 	'' \
+	'Browser wasm example:' \
+	'  make example-wasm-install # npm ci in packages/example-wasm' \
+	'  make example-wasm-build   # npm run build in packages/example-wasm' \
+	'  make example-wasm-typecheck # npm run typecheck in packages/example-wasm' \
+	'  make example-wasm-preview # npm run preview in packages/example-wasm' \
+	'  make example-wasm-deploy  # npm run deploy in packages/example-wasm' \
+	'' \
 	'Versioning:' \
-	'  make bump-version V=x.y.z # sync root Cargo workspace version and TS package versions' \
+	'  make bump-version V=x.y.z # sync Cargo/npm package versions and lockfiles' \
 	'' \
 		'Docker:' \
 		'  make docker-build         # docker build -t latlng-server:local .' \
@@ -320,11 +329,26 @@ wasm-test:
 wasm-pack-dry-run:
 	cd $(WASM_DIR) && $(NPM) --cache $(NPM_CACHE) pack --dry-run
 
+example-wasm-install:
+	cd $(EXAMPLE_WASM_DIR) && $(NPM) ci
+
+example-wasm-build:
+	cd $(EXAMPLE_WASM_DIR) && $(NPM) run build
+
+example-wasm-typecheck:
+	cd $(EXAMPLE_WASM_DIR) && $(NPM) run typecheck
+
+example-wasm-preview:
+	cd $(EXAMPLE_WASM_DIR) && $(NPM) run preview
+
+example-wasm-deploy:
+	cd $(EXAMPLE_WASM_DIR) && $(NPM) run deploy
+
 bump-version:
 ifndef V
 	$(error Usage: make bump-version V=x.y.z)
 endif
-	$(NODE) scripts/bump-version.mjs $(V)
+	$(NODE) scripts/bump-version.mjs "$(V)"
 
 docker-build:
 	$(DOCKER) build -t $(DOCKER_IMAGE) .
