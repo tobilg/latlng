@@ -51,6 +51,8 @@ run("wasm-bindgen", [
   wasmInput,
 ], packageRoot);
 
+verifyExternrefTableExport(wasmOutput, "wasm-bindgen output");
+
 const beforeBytes = statSync(wasmOutput).size;
 const wasmOptArgs = [
   "-Oz",
@@ -64,13 +66,23 @@ const wasmOptArgs = [
   "-o",
   optimizedWasmOutput,
 ];
-run("wasm-opt", wasmOptArgs, packageRoot);
-renameSync(optimizedWasmOutput, wasmOutput);
-const afterBytes = statSync(wasmOutput).size;
-console.log(
-  `wasm-opt ${wasmOptArgs.slice(0, -3).join(" ")} reduced latlng_core_bg.wasm from ${formatBytes(beforeBytes)} to ${formatBytes(afterBytes)}`,
-);
-verifyExternrefTableExport(wasmOutput);
+try {
+  run("wasm-opt", wasmOptArgs, packageRoot);
+  verifyExternrefTableExport(optimizedWasmOutput, "wasm-opt output");
+  renameSync(optimizedWasmOutput, wasmOutput);
+  const afterBytes = statSync(wasmOutput).size;
+  console.log(
+    `wasm-opt ${wasmOptArgs.slice(0, -3).join(" ")} reduced latlng_core_bg.wasm from ${formatBytes(beforeBytes)} to ${formatBytes(afterBytes)}`,
+  );
+} catch (error) {
+  rmSync(optimizedWasmOutput, { force: true });
+  console.warn(
+    `wasm-opt output failed validation; keeping wasm-bindgen output (${formatBytes(beforeBytes)}).`,
+  );
+  console.warn(error instanceof Error ? error.message : String(error));
+}
+
+verifyExternrefTableExport(wasmOutput, "final wasm");
 
 const generatedJs = resolve(outDir, "latlng_core.js");
 const source = readFileSync(generatedJs, "utf8");
@@ -86,7 +98,7 @@ function formatBytes(bytes: number): string {
   return `${(bytes / 1024).toFixed(1)} KiB`;
 }
 
-function verifyExternrefTableExport(filePath: string): void {
+function verifyExternrefTableExport(filePath: string, artifact: string): void {
   const wasm = readFileSync(filePath);
   const parser = createWasmParser(wasm);
   const tables: WasmTableType[] = [];
@@ -126,23 +138,23 @@ function verifyExternrefTableExport(filePath: string): void {
   }
 
   if (externrefsTableIndex === null) {
-    throw new Error("Built wasm is missing __wbindgen_externrefs table export");
+    throw new Error(`${artifact} is missing __wbindgen_externrefs table export`);
   }
 
   const table = tables[externrefsTableIndex];
   if (!table) {
     throw new Error(
-      `Built wasm exports __wbindgen_externrefs as table[${externrefsTableIndex}], but only ${tables.length} tables were found`,
+      `${artifact} exports __wbindgen_externrefs as table[${externrefsTableIndex}], but only ${tables.length} tables were found`,
     );
   }
 
   if (table.elementType !== "externref") {
     throw new Error(
-      `Built wasm exports __wbindgen_externrefs as table[${externrefsTableIndex}] (${table.elementType}); expected externref. Re-check wasm-opt flags.`,
+      `${artifact} exports __wbindgen_externrefs as table[${externrefsTableIndex}] (${table.elementType}); expected externref. Re-check wasm-opt flags.`,
     );
   }
 
-  console.log(`verified __wbindgen_externrefs -> table[${externrefsTableIndex}] externref`);
+  console.log(`verified ${artifact} __wbindgen_externrefs -> table[${externrefsTableIndex}] externref`);
 }
 
 function parseImportSection(parser: WasmParser, tables: WasmTableType[]): void {
