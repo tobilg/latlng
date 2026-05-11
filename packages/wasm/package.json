@@ -17,7 +17,9 @@
     }
   },
   "files": [
-    "dist",
+    "dist/**/*.d.ts",
+    "dist/**/*.js",
+    "dist/**/*.wasm",
     "README.md",
     "LICENSE"
   ],

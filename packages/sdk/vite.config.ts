@@ -9,7 +9,7 @@ export default defineConfig({
       fileName: () => "index.js",
     },
     outDir: "dist",
-    sourcemap: true,
+    sourcemap: false,
     target: "es2022",
   },
 });

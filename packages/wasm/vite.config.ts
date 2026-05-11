@@ -20,7 +20,7 @@ export default defineConfig({
     },
     outDir: "dist",
     assetsInlineLimit: 0,
-    sourcemap: true,
+    sourcemap: false,
     target: "es2022",
     rollupOptions: {
       external: ["node:fs", "node:path", "node:url"],

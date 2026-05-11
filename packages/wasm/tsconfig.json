@@ -6,7 +6,7 @@
     "lib": ["ES2022", "DOM", "DOM.Iterable"],
     "strict": true,
     "declaration": true,
-    "declarationMap": true,
+    "declarationMap": false,
     "rootDir": "src",
     "outDir": "dist",
     "isolatedModules": true,
