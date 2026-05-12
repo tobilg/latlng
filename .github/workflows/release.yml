@@ -279,6 +279,93 @@ jobs:
             dist/release-assets/openapi.json
             dist/release-assets/SHA256SUMS
 
+  homebrew-release:
+    needs: github-release
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref_name, 'v')
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Extract release version
+        id: version
+        shell: bash
+        run: echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Determine release mode
+        id: release_mode
+        shell: bash
+        run: |
+          if [ "${ACT:-}" = "true" ]; then
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Download published macOS release asset
+        if: steps.release_mode.outputs.publish == 'true'
+        shell: bash
+        run: |
+          mkdir -p .ci-artifacts/homebrew
+          curl --fail --location --silent --show-error \
+            --retry 12 --retry-delay 10 --retry-all-errors \
+            --output .ci-artifacts/homebrew/latlng-macos-arm64.tar.gz \
+            "https://github.com/tobilg/latlng/releases/download/v${{ steps.version.outputs.version }}/latlng-macos-arm64.tar.gz"
+
+      - name: Download macOS release artifact
+        if: steps.release_mode.outputs.publish != 'true'
+        uses: actions/download-artifact@v8
+        with:
+          name: latlng-release-macos-arm64
+          path: .ci-artifacts/homebrew
+
+      - name: Calculate Homebrew asset SHA256
+        id: sha
+        shell: bash
+        run: |
+          test -f .ci-artifacts/homebrew/latlng-macos-arm64.tar.gz
+          echo "sha256=$(sha256sum .ci-artifacts/homebrew/latlng-macos-arm64.tar.gz | cut -d ' ' -f 1)" >> "$GITHUB_OUTPUT"
+
+      - name: Render Homebrew formula
+        shell: bash
+        run: |
+          make homebrew-formula V="${{ steps.version.outputs.version }}" SHA256="${{ steps.sha.outputs.sha256 }}"
+          ruby -c dist/homebrew/latlng.rb
+
+      - name: Inspect Homebrew formula
+        if: steps.release_mode.outputs.publish != 'true'
+        run: sed -n '1,220p' dist/homebrew/latlng.rb
+
+      - name: Prepare Homebrew tap checkout
+        if: steps.release_mode.outputs.publish == 'true'
+        shell: bash
+        env:
+          HOMEBREW_TAP_TOKEN: ${{ secrets.HOMEBREW_TAP_TOKEN }}
+        run: |
+          test -n "$HOMEBREW_TAP_TOKEN"
+          git init tap
+          cd tap
+          git remote add origin "https://x-access-token:${HOMEBREW_TAP_TOKEN}@github.com/tobilg/homebrew-latlng.git"
+          if git ls-remote --exit-code --heads origin main >/dev/null 2>&1; then
+            git fetch --depth=1 origin main
+            git checkout -B main FETCH_HEAD
+          else
+            git checkout -B main
+          fi
+
+      - name: Commit Homebrew formula update
+        if: steps.release_mode.outputs.publish == 'true'
+        shell: bash
+        run: |
+          mkdir -p tap/Formula
+          cp dist/homebrew/latlng.rb tap/Formula/latlng.rb
+          cd tap
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add Formula/latlng.rb
+          git diff --staged --quiet || git commit -m "Update latlng to v${{ steps.version.outputs.version }}"
+          git push origin HEAD:main
+
   container-release:
     needs: binaries
     runs-on: ubuntu-latest

@@ -337,6 +337,37 @@ Config precedence is unchanged in containers:
 - environment variables
 - CLI flags
 
+## Homebrew
+
+macOS arm64 release binaries are published to the `tobilg/latlng` Homebrew tap:
+
+```sh
+brew tap tobilg/latlng
+brew install latlng
+```
+
+The formula installs `latlng-server` and `latlng-cli`. Its service uses AOF
+persistence by default and listens on `127.0.0.1:7421`.
+
+```sh
+brew services start latlng
+brew services stop latlng
+```
+
+Default Homebrew paths:
+
+| Purpose | Path |
+| --- | --- |
+| Config file | `$(brew --prefix)/etc/latlng/latlng.toml` |
+| AOF and webhook queue data | `$(brew --prefix)/var/latlng` |
+| Service log | `$(brew --prefix)/var/log/latlng/latlng-server.log` |
+
+Run the server manually with the same defaults:
+
+```sh
+latlng-server --config "$(brew --prefix)/etc/latlng/latlng.toml"
+```
+
 ## Server Configuration
 
 `latlng-server` reads JSON or TOML config files via `--config` or `LATLNG_CONFIG`.

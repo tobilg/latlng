@@ -10,6 +10,8 @@ ARTIFACT_SUFFIX ?= linux-x64
 BINARY_EXT ?=
 DIST_DIR ?= dist/$(ARTIFACT_SUFFIX)
 OPENAPI_OUTPUT ?= dist/openapi.json
+HOMEBREW_FORMULA_OUTPUT ?= dist/homebrew/latlng.rb
+HOMEBREW_ARTIFACT_URL ?=
 DOCKER_IMAGE ?= latlng-server:local
 DOCKER_PREBUILT_IMAGE ?= latlng-server:local-prebuilt
 LATLNG_SERVER_BINARY ?= target/release/latlng-server
@@ -35,14 +37,14 @@ ACT_RELEASE_EVENT ?= .github/act/release-tag-push.json
 
 .PHONY: help \
 	fmt fmt-check clippy test check-wasm check build build-release build-server build-server-release build-cli build-cli-release build-benchmark build-server-benchmark package-release-binaries \
-	verify-release-binaries openapi \
+	verify-release-binaries openapi homebrew-formula \
 	bench-server bench-server-capnp bench-server-aof bench-server-tile38 bench-server-write-heavy bench-server-aof-tuning bench-server-query-heavy bench-server-geofence-heavy bench-server-compare bench-server-compare-capnp bench-server-compare-tile38 \
 		sdk-install sdk-build sdk-docs sdk-typecheck sdk-test-unit sdk-test-integration sdk-test \
 	wasm-install wasm-build wasm-typecheck wasm-test wasm-pack-dry-run \
 	example-wasm-install example-wasm-build example-wasm-typecheck example-wasm-preview example-wasm-deploy \
 	bump-version \
 		docker-build docker-build-prebuilt docker-build-prebuilt-local docker-up docker-down docker-up-replication docker-down-replication \
-	act-ci act-ci-rust act-ci-sdk act-ci-wasm act-ci-docker act-release act-release-binaries act-release-github act-release-container
+	act-ci act-ci-rust act-ci-sdk act-ci-wasm act-ci-docker act-release act-release-binaries act-release-github act-release-container act-release-homebrew
 
 help:
 	@printf '%s\n' \
@@ -75,6 +77,7 @@ help:
 	'  make bench-server-compare-tile38 OLD=latlng.json NEW=tile38.json [COMPARE_TILE38_OUTPUT=cmp.json]' \
 	'  make package-release-binaries ARTIFACT_SUFFIX=linux-x64 [BINARY_EXT=.exe]' \
 	'  make verify-release-binaries ARTIFACT_SUFFIX=linux-x64 [BINARY_EXT=.exe]' \
+	'  make homebrew-formula V=x.y.z SHA256=... # render dist/homebrew/latlng.rb' \
 	'' \
 		'TypeScript SDK:' \
 		'  make sdk-install          # npm ci in packages/sdk' \
@@ -293,6 +296,19 @@ openapi:
 	$(CARGO) run -p latlng-server -- --print-openapi > "$(OPENAPI_OUTPUT)"
 	$(NODE) -e 'const fs=require("node:fs"); JSON.parse(fs.readFileSync(process.argv[1], "utf8"));' "$(OPENAPI_OUTPUT)"
 
+homebrew-formula:
+ifndef V
+	$(error Usage: make homebrew-formula V=x.y.z SHA256=<sha256>)
+endif
+ifndef SHA256
+	$(error Usage: make homebrew-formula V=x.y.z SHA256=<sha256>)
+endif
+	$(NODE) scripts/render-homebrew-formula.mjs \
+		--version "$(V)" \
+		--sha256 "$(SHA256)" \
+		--output "$(HOMEBREW_FORMULA_OUTPUT)" \
+		$(if $(HOMEBREW_ARTIFACT_URL),--artifact-url "$(HOMEBREW_ARTIFACT_URL)",)
+
 sdk-install:
 	cd $(SDK_DIR) && $(NPM) ci
 
@@ -400,3 +416,6 @@ act-release-github:
 
 act-release-container:
 	$(ACT) push -W .github/workflows/release.yml -e $(ACT_RELEASE_EVENT) -j container-release $(ACT_FLAGS)
+
+act-release-homebrew:
+	$(ACT) push -W .github/workflows/release.yml -e $(ACT_RELEASE_EVENT) -j homebrew-release $(ACT_FLAGS)
