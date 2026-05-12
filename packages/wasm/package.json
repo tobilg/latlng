@@ -1,6 +1,6 @@
 {
   "name": "@latlng/wasm",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "description": "Browser Web Worker and WebAssembly package for the latlng geospatial object engine",
   "type": "module",
   "main": "./dist/index.js",
