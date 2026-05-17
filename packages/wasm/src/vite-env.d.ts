@@ -1,7 +1,14 @@
 /// <reference types="vite/client" />
 
 declare module "../pkg/latlng_core.js" {
-  export default function init(input?: RequestInfo | URL | Response | BufferSource): Promise<void>;
+  type WasmInitInput = RequestInfo | URL | Response | BufferSource;
+
+  export default function init(
+    input?:
+      | WasmInitInput
+      | Promise<WasmInitInput>
+      | { module_or_path: WasmInitInput | Promise<WasmInitInput> },
+  ): Promise<void>;
 
   export class BrowserLatLng {
     constructor();

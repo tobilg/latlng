@@ -13,6 +13,7 @@ workspace = true
 
 [dependencies]
 clap.workspace = true
+latlng-auth = { path = "../../crates/latlng-auth" }
 latlng-config = { path = "../../crates/latlng-config" }
 latlng-storage-aof = { path = "../../crates/latlng-storage-aof" }
 reqwest.workspace = true

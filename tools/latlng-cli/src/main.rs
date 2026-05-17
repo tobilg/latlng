@@ -1,8 +1,14 @@
 #![forbid(unsafe_code)]
 
+use std::io::{self, Read};
 use std::path::PathBuf;
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use latlng_auth::{
+    AuthAction, AuthConfig, HmacJwtAlgorithm, HmacSecretFormat, HmacTokenOptions,
+    HmacTokenPermissionRule, create_hmac_jwt, decode_jwt_unverified, generate_hmac_secret,
+};
 use latlng_config::{config_reference_json, load_from_path};
 use latlng_storage_aof::{backup_aof, restore_aof, verify_aof};
 use reqwest::header::{AUTHORIZATION, CONTENT_TYPE};
@@ -46,6 +52,11 @@ pub const SUPPORTED_COMMANDS: &[&str] = &[
     "config-validate",
     "config-reference",
     "config-rewrite",
+    "token",
+    "token-create",
+    "token-secret",
+    "token-inspect",
+    "token-verify",
     "readonly",
     "timeout",
     "aofshrink",
@@ -240,6 +251,118 @@ enum Command {
         #[arg(long)]
         force: bool,
     },
+    Token {
+        #[command(subcommand)]
+        command: TokenCommand,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+enum TokenCommand {
+    Create(TokenCreateArgs),
+    Secret(TokenSecretArgs),
+    Inspect { token: String },
+    Verify(TokenVerifyArgs),
+}
+
+#[derive(Debug, Args)]
+struct TokenCreateArgs {
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[command(flatten)]
+    secret: TokenSecretSourceArgs,
+    #[arg(long)]
+    subject: Option<String>,
+    #[arg(long, default_value = "1h")]
+    ttl: String,
+    #[arg(long)]
+    issuer: Option<String>,
+    #[arg(long)]
+    audience: Option<String>,
+    #[arg(long, value_enum)]
+    algorithm: Option<CliHmacAlgorithm>,
+    #[arg(long, value_enum)]
+    preset: Vec<TokenPreset>,
+    #[arg(long)]
+    collection: Vec<String>,
+    #[arg(long)]
+    action: Vec<String>,
+    #[arg(long)]
+    admin: bool,
+    #[arg(long, value_enum, default_value = "token")]
+    format: TokenOutputFormat,
+}
+
+#[derive(Debug, Args)]
+struct TokenVerifyArgs {
+    token: String,
+    #[arg(long)]
+    config: Option<PathBuf>,
+    #[command(flatten)]
+    secret: TokenSecretSourceArgs,
+    #[arg(long)]
+    issuer: Option<String>,
+    #[arg(long)]
+    audience: Option<String>,
+    #[arg(long, value_enum)]
+    algorithm: Option<CliHmacAlgorithm>,
+}
+
+#[derive(Debug, Args, Default)]
+struct TokenSecretSourceArgs {
+    #[arg(long)]
+    secret: Option<String>,
+    #[arg(long)]
+    secret_env: Option<String>,
+    #[arg(long)]
+    secret_file: Option<PathBuf>,
+    #[arg(long)]
+    secret_stdin: bool,
+}
+
+#[derive(Debug, Args)]
+struct TokenSecretArgs {
+    #[arg(long, default_value_t = 32)]
+    bytes: usize,
+    #[arg(long, value_enum, default_value = "base64-url")]
+    format: TokenSecretOutputFormat,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CliHmacAlgorithm {
+    #[value(name = "HS256", alias = "hs256")]
+    Hs256,
+    #[value(name = "HS384", alias = "hs384")]
+    Hs384,
+    #[value(name = "HS512", alias = "hs512")]
+    Hs512,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum TokenPreset {
+    Readonly,
+    Writer,
+    Dashboard,
+    HooksAdmin,
+    ChannelsAdmin,
+    Metrics,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum TokenOutputFormat {
+    Token,
+    Json,
+    Env,
+    Curl,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+#[value(rename_all = "kebab-case")]
+enum TokenSecretOutputFormat {
+    Base64Url,
+    Hex,
 }
 
 #[tokio::main]
@@ -602,9 +725,368 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let report = restore_aof(backup, destination, force)?;
             println!("{}", serde_json::to_string_pretty(&report)?);
         }
+        Command::Token { command } => {
+            handle_token_command(command, &cli.base_url).await?;
+        }
     }
 
     Ok(())
+}
+
+async fn handle_token_command(
+    command: TokenCommand,
+    base_url: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    match command {
+        TokenCommand::Create(args) => create_token(args, base_url),
+        TokenCommand::Secret(args) => print_token_secret(args),
+        TokenCommand::Inspect { token } => inspect_token(&token),
+        TokenCommand::Verify(args) => verify_token(args).await,
+    }
+}
+
+fn create_token(args: TokenCreateArgs, base_url: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let resolved = resolve_token_config(
+        args.config.as_ref(),
+        &args.secret,
+        args.issuer.as_deref(),
+        args.audience.as_deref(),
+        args.algorithm,
+    )?;
+    let ttl_seconds = parse_duration_seconds(&args.ttl)?;
+    let issued_at = unix_timestamp()?;
+    let permissions = build_token_permissions(&args)?;
+    let options = HmacTokenOptions {
+        subject: args.subject.clone(),
+        issuer: resolved.issuer,
+        audience: resolved.audience,
+        issued_at,
+        not_before: Some(issued_at),
+        expires_at: issued_at + ttl_seconds,
+        permissions,
+        admin: args.admin,
+        algorithm: resolved.algorithm,
+    };
+    let token = create_hmac_jwt(&resolved.secret, &options)?;
+    match args.format {
+        TokenOutputFormat::Token => println!("{token}"),
+        TokenOutputFormat::Env => println!("LATLNG_TOKEN={token}"),
+        TokenOutputFormat::Curl => {
+            println!("curl -H 'Authorization: Bearer {token}' {base_url}/ping")
+        }
+        TokenOutputFormat::Json => {
+            let decoded = decode_jwt_unverified(&token)?;
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&serde_json::json!({
+                    "token": token,
+                    "header": decoded.header,
+                    "claims": decoded.claims
+                }))?
+            );
+        }
+    }
+    Ok(())
+}
+
+fn print_token_secret(args: TokenSecretArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let format = match args.format {
+        TokenSecretOutputFormat::Base64Url => HmacSecretFormat::Base64Url,
+        TokenSecretOutputFormat::Hex => HmacSecretFormat::Hex,
+    };
+    println!("{}", generate_hmac_secret(args.bytes, format)?);
+    Ok(())
+}
+
+fn inspect_token(token: &str) -> Result<(), Box<dyn std::error::Error>> {
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&decode_jwt_unverified(token)?)?
+    );
+    Ok(())
+}
+
+async fn verify_token(args: TokenVerifyArgs) -> Result<(), Box<dyn std::error::Error>> {
+    let resolved = resolve_token_config(
+        args.config.as_ref(),
+        &args.secret,
+        args.issuer.as_deref(),
+        args.audience.as_deref(),
+        args.algorithm,
+    )?;
+    let auth = AuthConfig {
+        jwt_secret: Some(resolved.secret),
+        jwt_algorithm: Some(resolved.algorithm.as_str().to_owned()),
+        jwt_issuer: resolved.issuer,
+        jwt_audience: resolved.audience,
+        ..AuthConfig::default()
+    }
+    .authenticator()?;
+    let principal = auth.authenticate(Some(&args.token)).await?;
+    let decoded = decode_jwt_unverified(&args.token)?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "ok": true,
+            "principal": {
+                "rate_limit_key": principal.rate_limit_key,
+                "admin": principal.is_admin()
+            },
+            "header": decoded.header,
+            "claims": decoded.claims
+        }))?
+    );
+    Ok(())
+}
+
+#[derive(Debug)]
+struct ResolvedTokenConfig {
+    secret: String,
+    issuer: Option<String>,
+    audience: Option<String>,
+    algorithm: HmacJwtAlgorithm,
+}
+
+fn resolve_token_config(
+    config_path: Option<&PathBuf>,
+    secret_source: &TokenSecretSourceArgs,
+    issuer_override: Option<&str>,
+    audience_override: Option<&str>,
+    algorithm_override: Option<CliHmacAlgorithm>,
+) -> Result<ResolvedTokenConfig, Box<dyn std::error::Error>> {
+    let config = match config_path {
+        Some(path) => Some(load_from_path(path)?),
+        None => std::env::var("LATLNG_CONFIG")
+            .ok()
+            .map(PathBuf::from)
+            .map(|path| load_from_path(&path))
+            .transpose()?,
+    };
+    if let Some(config) = &config
+        && (config.auth.jwt_public_key_pem.is_some() || config.auth.jwks_url.is_some())
+        && config.auth.jwt_secret.is_none()
+    {
+        return Err(
+            "token create/verify currently supports HMAC JWTs only; configure jwt_secret or pass a secret source"
+                .into(),
+        );
+    }
+
+    let secret = resolve_token_secret(
+        secret_source,
+        config
+            .as_ref()
+            .and_then(|config| config.auth.jwt_secret.as_deref().map(str::to_owned)),
+    )?;
+    let issuer = issuer_override.map(str::to_owned).or_else(|| {
+        config
+            .as_ref()
+            .and_then(|config| config.auth.jwt_issuer.clone())
+    });
+    let audience = audience_override.map(str::to_owned).or_else(|| {
+        config
+            .as_ref()
+            .and_then(|config| config.auth.jwt_audience.clone())
+    });
+    let algorithm = match algorithm_override {
+        Some(algorithm) => algorithm.into(),
+        None => config
+            .as_ref()
+            .and_then(|config| config.auth.jwt_algorithm.as_deref())
+            .map(HmacJwtAlgorithm::parse)
+            .transpose()?
+            .unwrap_or_default(),
+    };
+
+    if let Some(config) = &config
+        && config.production_mode
+        && issuer.as_deref().is_none_or(str::is_empty)
+    {
+        return Err("production token creation requires jwt_issuer or --issuer".into());
+    }
+    if let Some(config) = &config
+        && config.production_mode
+        && audience.as_deref().is_none_or(str::is_empty)
+    {
+        return Err("production token creation requires jwt_audience or --audience".into());
+    }
+
+    Ok(ResolvedTokenConfig {
+        secret,
+        issuer,
+        audience,
+        algorithm,
+    })
+}
+
+fn resolve_token_secret(
+    source: &TokenSecretSourceArgs,
+    config_secret: Option<String>,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let explicit_sources = usize::from(source.secret.is_some())
+        + usize::from(source.secret_env.is_some())
+        + usize::from(source.secret_file.is_some())
+        + usize::from(source.secret_stdin);
+    if explicit_sources > 1 {
+        return Err(
+            "pass only one of --secret, --secret-env, --secret-file, or --secret-stdin".into(),
+        );
+    }
+    let secret = if let Some(secret) = &source.secret {
+        secret.clone()
+    } else if let Some(name) = &source.secret_env {
+        std::env::var(name).map_err(|_| format!("environment variable {name} is not set"))?
+    } else if let Some(path) = &source.secret_file {
+        strip_trailing_newlines(std::fs::read_to_string(path)?)
+    } else if source.secret_stdin {
+        let mut input = String::new();
+        io::stdin().read_to_string(&mut input)?;
+        strip_trailing_newlines(input)
+    } else if let Some(secret) = config_secret {
+        secret
+    } else if let Ok(secret) = std::env::var("LATLNG_JWT_SECRET") {
+        secret
+    } else {
+        return Err(
+            "missing HMAC secret; pass --config, --secret-env, --secret-file, or --secret-stdin"
+                .into(),
+        );
+    };
+    if secret.is_empty() {
+        return Err("jwt_secret must not be empty".into());
+    }
+    Ok(secret)
+}
+
+fn strip_trailing_newlines(mut value: String) -> String {
+    while value.ends_with('\n') || value.ends_with('\r') {
+        value.pop();
+    }
+    value
+}
+
+impl From<CliHmacAlgorithm> for HmacJwtAlgorithm {
+    fn from(value: CliHmacAlgorithm) -> Self {
+        match value {
+            CliHmacAlgorithm::Hs256 => Self::Hs256,
+            CliHmacAlgorithm::Hs384 => Self::Hs384,
+            CliHmacAlgorithm::Hs512 => Self::Hs512,
+        }
+    }
+}
+
+fn build_token_permissions(
+    args: &TokenCreateArgs,
+) -> Result<Vec<HmacTokenPermissionRule>, Box<dyn std::error::Error>> {
+    let mut permissions = Vec::new();
+    for preset in &args.preset {
+        permissions.push(permission_for_preset(*preset, &args.collection)?);
+    }
+    if !args.action.is_empty() {
+        if args.collection.is_empty() {
+            return Err("--action requires at least one --collection".into());
+        }
+        permissions.push(HmacTokenPermissionRule::from_action_names(
+            args.collection.clone(),
+            args.action.iter(),
+        )?);
+    }
+    if !args.admin && permissions.is_empty() {
+        return Err("token create requires --admin, --preset, or at least one --action".into());
+    }
+    Ok(permissions)
+}
+
+fn permission_for_preset(
+    preset: TokenPreset,
+    collections: &[String],
+) -> Result<HmacTokenPermissionRule, Box<dyn std::error::Error>> {
+    let collection_patterns = match preset {
+        TokenPreset::Metrics => vec!["*".to_owned()],
+        _ if collections.is_empty() => {
+            return Err(format!("--preset {preset} requires --collection").into());
+        }
+        _ => collections.to_vec(),
+    };
+    Ok(HmacTokenPermissionRule::from_actions(
+        collection_patterns,
+        preset.actions().iter().copied(),
+    ))
+}
+
+impl TokenPreset {
+    fn actions(self) -> &'static [AuthAction] {
+        match self {
+            Self::Readonly => &[
+                AuthAction::CollectionsList,
+                AuthAction::CollectionsInspect,
+                AuthAction::ObjectsRead,
+                AuthAction::QueriesRead,
+            ],
+            Self::Writer => &[
+                AuthAction::CollectionsList,
+                AuthAction::CollectionsInspect,
+                AuthAction::ObjectsRead,
+                AuthAction::ObjectsWrite,
+                AuthAction::ObjectsDelete,
+                AuthAction::QueriesRead,
+            ],
+            Self::Dashboard => &[
+                AuthAction::CollectionsList,
+                AuthAction::QueriesRead,
+                AuthAction::SubscriptionsRead,
+            ],
+            Self::HooksAdmin => &[AuthAction::HooksManage],
+            Self::ChannelsAdmin => &[AuthAction::ChannelsManage],
+            Self::Metrics => &[AuthAction::MetricsRead],
+        }
+    }
+}
+
+impl std::fmt::Display for TokenPreset {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::Readonly => "readonly",
+            Self::Writer => "writer",
+            Self::Dashboard => "dashboard",
+            Self::HooksAdmin => "hooks-admin",
+            Self::ChannelsAdmin => "channels-admin",
+            Self::Metrics => "metrics",
+        })
+    }
+}
+
+fn parse_duration_seconds(value: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err("duration must not be empty".into());
+    }
+    let split_at = trimmed
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (number, unit) = trimmed.split_at(split_at);
+    if number.is_empty() {
+        return Err(format!("invalid duration: {value}").into());
+    }
+    let amount: u64 = number.parse()?;
+    let multiplier = match unit {
+        "" | "s" => 1,
+        "m" => 60,
+        "h" => 60 * 60,
+        "d" => 24 * 60 * 60,
+        other => return Err(format!("unsupported duration unit: {other}").into()),
+    };
+    let seconds = amount
+        .checked_mul(multiplier)
+        .ok_or("duration is too large")?;
+    if seconds == 0 {
+        return Err("duration must be greater than zero".into());
+    }
+    Ok(seconds)
+}
+
+fn unix_timestamp() -> Result<u64, Box<dyn std::error::Error>> {
+    Ok(SystemTime::now().duration_since(UNIX_EPOCH)?.as_secs())
 }
 
 fn get(
@@ -812,7 +1294,10 @@ fn normalize_command(value: &str) -> Result<String, Box<dyn std::error::Error>> 
 
 #[cfg(test)]
 mod tests {
-    use super::{SUPPORTED_COMMANDS, geofence_def_from_geojson, object_path, wildcard_path};
+    use super::{
+        SUPPORTED_COMMANDS, TokenPreset, geofence_def_from_geojson, object_path,
+        parse_duration_seconds, permission_for_preset, wildcard_path,
+    };
     use std::fs;
 
     #[test]
@@ -831,6 +1316,31 @@ mod tests {
             wildcard_path("properties/driver name"),
             "properties/driver%20name"
         );
+    }
+
+    #[test]
+    fn token_duration_parser_accepts_common_units() {
+        assert_eq!(parse_duration_seconds("30s").unwrap(), 30);
+        assert_eq!(parse_duration_seconds("15m").unwrap(), 900);
+        assert_eq!(parse_duration_seconds("2h").unwrap(), 7_200);
+        assert_eq!(parse_duration_seconds("7d").unwrap(), 604_800);
+        assert_eq!(parse_duration_seconds("60").unwrap(), 60);
+        assert!(parse_duration_seconds("0s").is_err());
+        assert!(parse_duration_seconds("1w").is_err());
+    }
+
+    #[test]
+    fn token_presets_expand_to_expected_permissions() {
+        let readonly =
+            permission_for_preset(TokenPreset::Readonly, &["fleet-*".to_owned()]).unwrap();
+        assert_eq!(readonly.collections, vec!["fleet-*".to_owned()]);
+        assert!(readonly.actions.contains(&"objects:read".to_owned()));
+        assert!(readonly.actions.contains(&"queries:read".to_owned()));
+
+        let metrics = permission_for_preset(TokenPreset::Metrics, &[]).unwrap();
+        assert_eq!(metrics.collections, vec!["*".to_owned()]);
+        assert_eq!(metrics.actions, vec!["metrics:read".to_owned()]);
+        assert!(permission_for_preset(TokenPreset::Writer, &[]).is_err());
     }
 
     #[test]

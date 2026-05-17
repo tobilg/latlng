@@ -3,9 +3,15 @@
 use std::collections::HashSet;
 use std::time::{Duration, Instant};
 
+use base64::Engine as _;
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use glob_match::glob_match;
 use jsonwebtoken::jwk::JwkSet;
-use jsonwebtoken::{Algorithm, DecodingKey, Validation, decode, decode_header};
+use jsonwebtoken::{
+    Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, decode_header, encode,
+};
+use rand::RngCore;
+use rand::rngs::OsRng;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -87,6 +93,22 @@ pub enum AuthAction {
 }
 
 impl AuthAction {
+    pub const ALL: [Self; 13] = [
+        Self::CollectionsList,
+        Self::CollectionsCreate,
+        Self::CollectionsDelete,
+        Self::CollectionsInspect,
+        Self::ObjectsRead,
+        Self::ObjectsWrite,
+        Self::ObjectsDelete,
+        Self::QueriesRead,
+        Self::SubscriptionsRead,
+        Self::HooksManage,
+        Self::ChannelsManage,
+        Self::MetricsRead,
+        Self::AdminAll,
+    ];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::CollectionsList => "collections:list",
@@ -123,6 +145,271 @@ impl AuthAction {
             _ => None,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum HmacJwtAlgorithm {
+    #[default]
+    Hs256,
+    Hs384,
+    Hs512,
+}
+
+impl HmacJwtAlgorithm {
+    pub fn parse(value: &str) -> Result<Self, TokenError> {
+        match value.trim().to_ascii_uppercase().as_str() {
+            "HS256" => Ok(Self::Hs256),
+            "HS384" => Ok(Self::Hs384),
+            "HS512" => Ok(Self::Hs512),
+            other => Err(TokenError::InvalidAlgorithm(other.to_owned())),
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Hs256 => "HS256",
+            Self::Hs384 => "HS384",
+            Self::Hs512 => "HS512",
+        }
+    }
+
+    fn algorithm(self) -> Algorithm {
+        match self {
+            Self::Hs256 => Algorithm::HS256,
+            Self::Hs384 => Algorithm::HS384,
+            Self::Hs512 => Algorithm::HS512,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HmacSecretFormat {
+    Base64Url,
+    Hex,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HmacTokenPermissionRule {
+    pub collections: Vec<String>,
+    pub actions: Vec<String>,
+}
+
+impl HmacTokenPermissionRule {
+    pub fn from_actions(
+        collections: Vec<String>,
+        actions: impl IntoIterator<Item = AuthAction>,
+    ) -> Self {
+        Self {
+            collections,
+            actions: actions
+                .into_iter()
+                .map(AuthAction::as_str)
+                .map(str::to_owned)
+                .collect(),
+        }
+    }
+
+    pub fn from_action_names(
+        collections: Vec<String>,
+        actions: impl IntoIterator<Item = impl AsRef<str>>,
+    ) -> Result<Self, TokenError> {
+        let mut parsed = Vec::new();
+        for action in actions {
+            let action = action.as_ref();
+            let Some(parsed_action) = AuthAction::parse(action.trim()) else {
+                return Err(TokenError::InvalidAction(action.to_owned()));
+            };
+            parsed.push(parsed_action);
+        }
+        Ok(Self::from_actions(collections, parsed))
+    }
+
+    fn validate(&self) -> Result<(), TokenError> {
+        if self
+            .collections
+            .iter()
+            .any(|collection| collection.trim().is_empty())
+        {
+            return Err(TokenError::InvalidOptions(
+                "permission collections must not be empty".to_owned(),
+            ));
+        }
+        if self.actions.is_empty() {
+            return Err(TokenError::InvalidOptions(
+                "permission actions must not be empty".to_owned(),
+            ));
+        }
+        for action in &self.actions {
+            if AuthAction::parse(action).is_none() {
+                return Err(TokenError::InvalidAction(action.clone()));
+            }
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HmacTokenOptions {
+    pub subject: Option<String>,
+    pub issuer: Option<String>,
+    pub audience: Option<String>,
+    pub issued_at: u64,
+    pub not_before: Option<u64>,
+    pub expires_at: u64,
+    pub permissions: Vec<HmacTokenPermissionRule>,
+    pub admin: bool,
+    pub algorithm: HmacJwtAlgorithm,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct HmacTokenClaims {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sub: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub iss: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub aud: Option<String>,
+    pub iat: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub nbf: Option<u64>,
+    pub exp: u64,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub latlng_permissions: Vec<HmacTokenPermissionRule>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub latlng_admin: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DecodedJwt {
+    pub header: serde_json::Value,
+    pub claims: serde_json::Value,
+}
+
+#[derive(Debug, Error)]
+pub enum TokenError {
+    #[error("unsupported HMAC JWT algorithm: {0}")]
+    InvalidAlgorithm(String),
+    #[error("unsupported latlng auth action: {0}")]
+    InvalidAction(String),
+    #[error("invalid token options: {0}")]
+    InvalidOptions(String),
+    #[error("invalid JWT: {0}")]
+    InvalidJwt(String),
+    #[error("failed to sign JWT: {0}")]
+    Sign(#[from] jsonwebtoken::errors::Error),
+}
+
+pub fn create_hmac_jwt(secret: &str, options: &HmacTokenOptions) -> Result<String, TokenError> {
+    if secret.is_empty() {
+        return Err(TokenError::InvalidOptions(
+            "jwt_secret must not be empty".to_owned(),
+        ));
+    }
+    let claims = options.claims()?;
+    encode(
+        &Header::new(options.algorithm.algorithm()),
+        &claims,
+        &EncodingKey::from_secret(secret.as_bytes()),
+    )
+    .map_err(TokenError::Sign)
+}
+
+pub fn generate_hmac_secret(
+    byte_len: usize,
+    format: HmacSecretFormat,
+) -> Result<String, TokenError> {
+    if byte_len == 0 {
+        return Err(TokenError::InvalidOptions(
+            "secret byte length must be greater than zero".to_owned(),
+        ));
+    }
+    let mut bytes = vec![0_u8; byte_len];
+    OsRng.fill_bytes(&mut bytes);
+    Ok(match format {
+        HmacSecretFormat::Base64Url => URL_SAFE_NO_PAD.encode(bytes),
+        HmacSecretFormat::Hex => bytes_to_hex(&bytes),
+    })
+}
+
+pub fn decode_jwt_unverified(token: &str) -> Result<DecodedJwt, TokenError> {
+    let mut parts = token.split('.');
+    let header = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| TokenError::InvalidJwt("missing header segment".to_owned()))?;
+    let claims = parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| TokenError::InvalidJwt("missing claims segment".to_owned()))?;
+    parts
+        .next()
+        .filter(|part| !part.is_empty())
+        .ok_or_else(|| TokenError::InvalidJwt("missing signature segment".to_owned()))?;
+    if parts.next().is_some() {
+        return Err(TokenError::InvalidJwt(
+            "expected exactly three JWT segments".to_owned(),
+        ));
+    }
+    Ok(DecodedJwt {
+        header: decode_jwt_segment(header, "header")?,
+        claims: decode_jwt_segment(claims, "claims")?,
+    })
+}
+
+impl HmacTokenOptions {
+    pub fn claims(&self) -> Result<HmacTokenClaims, TokenError> {
+        if !self.admin && self.permissions.is_empty() {
+            return Err(TokenError::InvalidOptions(
+                "token must be admin or include at least one permission rule".to_owned(),
+            ));
+        }
+        if self.expires_at <= self.issued_at {
+            return Err(TokenError::InvalidOptions(
+                "expires_at must be later than issued_at".to_owned(),
+            ));
+        }
+        if let Some(not_before) = self.not_before
+            && not_before >= self.expires_at
+        {
+            return Err(TokenError::InvalidOptions(
+                "not_before must be earlier than expires_at".to_owned(),
+            ));
+        }
+        for permission in &self.permissions {
+            permission.validate()?;
+        }
+        Ok(HmacTokenClaims {
+            sub: self.subject.clone(),
+            iss: self.issuer.clone(),
+            aud: self.audience.clone(),
+            iat: self.issued_at,
+            nbf: self.not_before,
+            exp: self.expires_at,
+            latlng_permissions: self.permissions.clone(),
+            latlng_admin: self.admin,
+        })
+    }
+}
+
+fn decode_jwt_segment(segment: &str, name: &str) -> Result<serde_json::Value, TokenError> {
+    let bytes = URL_SAFE_NO_PAD
+        .decode(segment)
+        .map_err(|error| TokenError::InvalidJwt(format!("invalid {name} encoding: {error}")))?;
+    serde_json::from_slice(&bytes)
+        .map_err(|error| TokenError::InvalidJwt(format!("invalid {name} JSON: {error}")))
+}
+
+fn bytes_to_hex(bytes: &[u8]) -> String {
+    let mut output = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        use std::fmt::Write as _;
+        let _ = write!(&mut output, "{byte:02x}");
+    }
+    output
+}
+
+fn is_false(value: &bool) -> bool {
+    !*value
 }
 
 const COLLECTION_VISIBILITY_ACTIONS: [AuthAction; 8] = [
@@ -639,7 +926,11 @@ mod tests {
     use serde_json::json;
     use tokio::net::TcpListener;
 
-    use super::{AuthAction, AuthConfig, AuthError, extract_bearer_token};
+    use super::{
+        AuthAction, AuthConfig, AuthError, HmacJwtAlgorithm, HmacSecretFormat, HmacTokenOptions,
+        HmacTokenPermissionRule, create_hmac_jwt, decode_jwt_unverified, extract_bearer_token,
+        generate_hmac_secret,
+    };
 
     fn exp_offset(seconds: i64) -> usize {
         let now = SystemTime::now()
@@ -956,6 +1247,143 @@ C/edCMRM78P8eQTBCDUTK1ywSYaszvQZvneiW6gNtWEJndSreEcyyUdVvg==
             open.authenticate(None).await.unwrap().rate_limit_key,
             "open:access"
         );
+    }
+
+    #[tokio::test]
+    async fn minted_hmac_token_authenticates_with_scoped_permissions() {
+        let issued_at = exp_offset(0) as u64;
+        let token = create_hmac_jwt(
+            "secret",
+            &HmacTokenOptions {
+                subject: Some("dashboard-1".to_owned()),
+                issuer: Some("https://id.example.com".to_owned()),
+                audience: Some("latlng".to_owned()),
+                issued_at,
+                not_before: Some(issued_at),
+                expires_at: issued_at + 60,
+                permissions: vec![HmacTokenPermissionRule::from_actions(
+                    vec!["fleet-*".to_owned()],
+                    [AuthAction::CollectionsList, AuthAction::QueriesRead],
+                )],
+                admin: false,
+                algorithm: HmacJwtAlgorithm::Hs256,
+            },
+        )
+        .unwrap();
+
+        let auth = AuthConfig {
+            jwt_secret: Some("secret".to_owned()),
+            jwt_issuer: Some("https://id.example.com".to_owned()),
+            jwt_audience: Some("latlng".to_owned()),
+            ..AuthConfig::default()
+        }
+        .authenticator()
+        .unwrap();
+        let principal = auth.authenticate(Some(&token)).await.unwrap();
+        assert_eq!(principal.rate_limit_key, "jwt:sub:dashboard-1");
+        assert!(principal.allows(AuthAction::QueriesRead, "fleet-eu"));
+        assert!(!principal.allows(AuthAction::ObjectsWrite, "fleet-eu"));
+        assert!(!principal.allows(AuthAction::QueriesRead, "other"));
+    }
+
+    #[tokio::test]
+    async fn minted_hs512_admin_token_authenticates() {
+        let issued_at = exp_offset(0) as u64;
+        let token = create_hmac_jwt(
+            "secret",
+            &HmacTokenOptions {
+                subject: Some("admin".to_owned()),
+                issuer: None,
+                audience: None,
+                issued_at,
+                not_before: None,
+                expires_at: issued_at + 60,
+                permissions: Vec::new(),
+                admin: true,
+                algorithm: HmacJwtAlgorithm::Hs512,
+            },
+        )
+        .unwrap();
+
+        let auth = AuthConfig {
+            jwt_secret: Some("secret".to_owned()),
+            jwt_algorithm: Some("HS512".to_owned()),
+            ..AuthConfig::default()
+        }
+        .authenticator()
+        .unwrap();
+        assert!(auth.authenticate(Some(&token)).await.unwrap().is_admin());
+    }
+
+    #[tokio::test]
+    async fn minted_expired_token_is_rejected() {
+        let issued_at = exp_offset(-120) as u64;
+        let token = create_hmac_jwt(
+            "secret",
+            &HmacTokenOptions {
+                subject: Some("demo".to_owned()),
+                issuer: None,
+                audience: None,
+                issued_at,
+                not_before: None,
+                expires_at: issued_at + 60,
+                permissions: vec![HmacTokenPermissionRule::from_actions(
+                    vec!["fleet".to_owned()],
+                    [AuthAction::ObjectsRead],
+                )],
+                admin: false,
+                algorithm: HmacJwtAlgorithm::Hs256,
+            },
+        )
+        .unwrap();
+        let auth = AuthConfig {
+            jwt_secret: Some("secret".to_owned()),
+            ..AuthConfig::default()
+        }
+        .authenticator()
+        .unwrap();
+        match auth.authenticate(Some(&token)).await {
+            Err(AuthError::Unauthorized) => {}
+            other => panic!("unexpected result: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn token_helpers_reject_invalid_actions_and_decode_claims() {
+        assert!(
+            HmacTokenPermissionRule::from_action_names(vec!["fleet".to_owned()], ["nope"]).is_err()
+        );
+        let issued_at = exp_offset(0) as u64;
+        let token = create_hmac_jwt(
+            "secret",
+            &HmacTokenOptions {
+                subject: Some("demo".to_owned()),
+                issuer: None,
+                audience: None,
+                issued_at,
+                not_before: None,
+                expires_at: issued_at + 60,
+                permissions: vec![HmacTokenPermissionRule::from_actions(
+                    vec!["fleet".to_owned()],
+                    [AuthAction::ObjectsRead],
+                )],
+                admin: false,
+                algorithm: HmacJwtAlgorithm::Hs384,
+            },
+        )
+        .unwrap();
+        let decoded = decode_jwt_unverified(&token).unwrap();
+        assert_eq!(decoded.header["alg"], "HS384");
+        assert_eq!(decoded.claims["sub"], "demo");
+    }
+
+    #[test]
+    fn generated_hmac_secrets_use_requested_format() {
+        let base64url = generate_hmac_secret(32, HmacSecretFormat::Base64Url).unwrap();
+        let hex = generate_hmac_secret(32, HmacSecretFormat::Hex).unwrap();
+        assert!(!base64url.is_empty());
+        assert_eq!(hex.len(), 64);
+        assert!(hex.chars().all(|ch| ch.is_ascii_hexdigit()));
     }
 
     #[test]

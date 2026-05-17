@@ -220,7 +220,6 @@ CLI flags:
 Example HMAC config:
 
 ```toml
-[auth]
 disable_bearer_token = true
 jwt_secret = "replace-me"
 jwt_algorithm = "HS256"
@@ -229,10 +228,116 @@ jwt_audience = "latlng"
 jwt_leeway_seconds = 5
 ```
 
+## Creating HMAC JWTs With `latlng-cli`
+
+`latlng-cli` can generate HMAC JWT secrets and mint scoped JWTs that use the existing
+`latlng_permissions` claim shape. This is intended for local and self-hosted deployments
+where `latlng-server` verifies tokens with `jwt_secret`. It does not mint asymmetric
+JWTs or publish JWKS keys.
+
+Generate a strong HMAC secret:
+
+```sh
+latlng-cli token secret > .latlng-jwt-secret
+```
+
+Configure the server with that secret:
+
+```toml
+disable_bearer_token = true
+jwt_secret = "<contents of .latlng-jwt-secret>"
+jwt_algorithm = "HS256"
+jwt_issuer = "https://id.example.com"
+jwt_audience = "latlng"
+```
+
+Create a token from the config:
+
+```sh
+TOKEN="$(latlng-cli token create \
+  --config ./latlng.toml \
+  --subject dashboard-1 \
+  --ttl 24h \
+  --preset dashboard \
+  --collection 'fleet-*')"
+```
+
+Use the token:
+
+```sh
+LATLNG_TOKEN="$TOKEN" latlng-cli collections
+curl -H "Authorization: Bearer $TOKEN" http://127.0.0.1:7421/ping
+```
+
+Verify a token locally before handing it to a client:
+
+```sh
+latlng-cli token verify "$TOKEN" --config ./latlng.toml
+```
+
+Inspect a token without verifying its signature:
+
+```sh
+latlng-cli token inspect "$TOKEN"
+```
+
+Secret sources:
+
+- `--config ./latlng.toml` reads `jwt_secret`, `jwt_algorithm`, `jwt_issuer`, and `jwt_audience`
+- `--secret-env NAME` reads the HMAC secret from an environment variable
+- `--secret-file PATH` reads the HMAC secret from a file and strips trailing newlines
+- `--secret-stdin` reads the HMAC secret from standard input and strips trailing newlines
+- `LATLNG_JWT_SECRET` is used as a fallback when no config secret or explicit secret source is provided
+
+Token output formats:
+
+```sh
+latlng-cli token create ... --format token
+latlng-cli token create ... --format json
+latlng-cli token create ... --format env
+latlng-cli token create ... --format curl
+```
+
+Permission presets:
+
+| Preset | Collections | Actions |
+| --- | --- | --- |
+| `readonly` | requires `--collection` | `collections:list`, `collections:inspect`, `objects:read`, `queries:read` |
+| `writer` | requires `--collection` | `collections:list`, `collections:inspect`, `objects:read`, `objects:write`, `objects:delete`, `queries:read` |
+| `dashboard` | requires `--collection` | `collections:list`, `queries:read`, `subscriptions:read` |
+| `hooks-admin` | requires `--collection` | `hooks:manage` |
+| `channels-admin` | requires `--collection` | `channels:manage` |
+| `metrics` | always `*` | `metrics:read` |
+
+You can also pass explicit actions:
+
+```sh
+latlng-cli token create \
+  --config ./latlng.toml \
+  --subject writer-1 \
+  --ttl 2h \
+  --collection fleet-eu \
+  --action collections:list \
+  --action objects:read \
+  --action objects:write
+```
+
+Create a full-admin JWT only when you intentionally need one:
+
+```sh
+latlng-cli token create --config ./latlng.toml --subject admin-1 --ttl 15m --admin
+```
+
+Troubleshooting:
+
+- `unauthorized` during verification usually means the wrong secret, algorithm, issuer, audience, or an expired token
+- `forbidden` from the server means the token is valid but lacks the required action or collection pattern
+- `metrics:read` must be global; use the `metrics` preset instead of a collection-specific rule
+- configs using `jwt_public_key_pem` or `jwks_url` can verify tokens but cannot be used by the CLI to mint HMAC JWTs
+
 Example PEM config:
 
 ```toml
-[auth]
 disable_bearer_token = true
 jwt_public_key_pem = """
 -----BEGIN PUBLIC KEY-----
@@ -247,7 +352,6 @@ jwt_audience = "latlng"
 Example JWKS config:
 
 ```toml
-[auth]
 disable_bearer_token = true
 jwt_algorithm = "RS256"
 jwt_issuer = "https://id.example.com"
@@ -258,6 +362,123 @@ jwks_refresh_interval_seconds = 300
 jwks_cache_ttl_seconds = 3600
 jwks_http_timeout_ms = 3000
 ```
+
+## Using An External IdP With JWKS
+
+`latlng` can verify JWT access tokens issued by an external identity provider. In this
+mode, `latlng-server` is a resource server:
+
+- the IdP authenticates users or services
+- the IdP issues signed JWT access tokens
+- clients send those tokens to `latlng` as bearer tokens
+- `latlng` fetches signing keys from the IdP's JWKS endpoint and enforces the
+  `latlng_permissions` or `latlng_admin` claims in the token
+
+`latlng` does not redirect users, run an OAuth login flow, call token introspection,
+fetch userinfo, or map IdP groups/scopes to permissions. The access token itself must
+contain the `latlng` authorization claims.
+
+Basic setup:
+
+1. Create an API/resource in your IdP for `latlng`.
+2. Choose the expected audience, for example `latlng`.
+3. Configure the IdP to sign access tokens with `RS256` or `ES256`.
+4. Add a token mapper, rule, action, hook, or custom claim transform that emits
+   `latlng_permissions` or `latlng_admin` into access tokens.
+5. Configure `latlng-server` with the issuer, audience, algorithm, and JWKS URL.
+
+Use the IdP's OpenID Connect discovery document if it provides one. The discovery
+document is commonly available at:
+
+```text
+<issuer>/.well-known/openid-configuration
+```
+
+Use these values from that document:
+
+- `issuer` -> `jwt_issuer`
+- `jwks_uri` -> `jwks_url`
+
+The configured `jwt_issuer` must match the token's `iss` claim exactly. The configured
+`jwt_audience` must match the token's `aud` claim.
+
+Example resource-server config:
+
+```toml
+require_auth = true
+disable_bearer_token = true
+
+jwt_algorithm = "RS256"
+jwt_issuer = "https://idp.example.com/realms/latlng"
+jwt_audience = "latlng"
+
+jwks_url = "https://idp.example.com/realms/latlng/protocol/openid-connect/certs"
+jwks_provider_id = "primary-idp"
+jwks_refresh_interval_seconds = 300
+jwks_cache_ttl_seconds = 3600
+jwks_http_timeout_ms = 3000
+```
+
+Example access token payload:
+
+```json
+{
+  "sub": "user-123",
+  "iss": "https://idp.example.com/realms/latlng",
+  "aud": "latlng",
+  "exp": 4102444800,
+  "latlng_permissions": [
+    {
+      "collections": ["fleet-*"],
+      "actions": ["collections:list", "objects:read", "queries:read"]
+    }
+  ]
+}
+```
+
+Admin access uses `latlng_admin`:
+
+```json
+{
+  "sub": "ops-admin-1",
+  "iss": "https://idp.example.com/realms/latlng",
+  "aud": "latlng",
+  "exp": 4102444800,
+  "latlng_admin": true
+}
+```
+
+Clients use the IdP-issued access token exactly like any other bearer token:
+
+```sh
+curl -H "Authorization: Bearer $ACCESS_TOKEN" http://127.0.0.1:7421/collections
+LATLNG_TOKEN="$ACCESS_TOKEN" latlng-cli collections
+```
+
+For SDK clients:
+
+```ts
+import { LatLngClient } from "@latlng/sdk";
+
+const client = new LatLngClient({
+  leaderUrl: "https://latlng.example.com",
+  token: accessTokenFromYourIdp,
+});
+```
+
+Provider notes:
+
+- Keycloak-style setups usually add `latlng_permissions` with a client scope or protocol mapper.
+- Auth0/Okta-style setups usually add it with an action, rule, authorization server claim, or access-token custom claim.
+- Some IdPs restrict arbitrary top-level custom claims. If your IdP cannot emit `latlng_permissions` or `latlng_admin` as top-level claims in an access token, use a small token broker or edge service to exchange the IdP token for a `latlng` JWT.
+- Use access tokens, not ID tokens. ID tokens are meant for the client application and often have the wrong audience.
+
+Troubleshooting IdP tokens:
+
+- `401 unauthorized` usually means signature verification failed, the token is expired, the `kid` is missing or not present in JWKS, `iss` or `aud` does not match, or the configured algorithm does not match the token header.
+- `403 forbidden` means the token is valid but lacks the required `latlng_permissions` action or collection pattern.
+- If key rotation breaks auth, check that `jwks_refresh_interval_seconds`, `jwks_cache_ttl_seconds`, and IdP JWKS cache headers are compatible with your IdP's rotation policy.
+- `latlng-cli token create` is only for HMAC JWTs. It does not mint IdP/JWKS tokens.
 
 ## JWKS Behavior
 

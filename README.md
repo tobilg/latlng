@@ -268,8 +268,8 @@ Build the image:
 docker build -t latlng-server .
 ```
 
-Published release images are available from Docker Hub as `tobilg/latlng:<tag>`,
-for example `tobilg/latlng:v0.1.0`.
+Published release images are available from Docker Hub as `tobilg/latlng:latest`
+and versioned tags such as `tobilg/latlng:v0.1.2`.
 
 Run a single node from the published image with a mounted config file and persistent
 data volume:
@@ -281,7 +281,7 @@ docker run --rm \
   -p 7422:7422 \
   -v "$(pwd)/examples/docker/single-node.toml:/etc/latlng/latlng.toml:ro" \
   -v latlng-data:/var/lib/latlng \
-  tobilg/latlng:v0.1.0
+  tobilg/latlng:latest
 ```
 
 The bundled single-node example config uses:
@@ -473,7 +473,40 @@ CLI:
 
 - uses typed `clap` subcommands with `--help` output for command documentation
 - automatically attaches `Authorization: Bearer ...` when `LATLNG_TOKEN` is set
+- can generate HMAC JWT secrets and scoped JWTs for local or self-hosted deployments
 - covers `ping`, `healthz`, `server`, `info`, `collections`, `metrics`, `bounds`, `stats`, `get`, `set-point`, `nearby`, `config-get`, `config-set`, `config-validate`, `config-reference`, `config-rewrite`, `readonly`, `timeout`, `aofshrink`, `aof-verify`, `aof-backup`, and `aof-restore`
+
+Create a scoped HMAC JWT:
+
+```sh
+latlng-cli token secret > .latlng-jwt-secret
+```
+
+```toml
+require_auth = true
+disable_bearer_token = true
+jwt_secret = "<contents of .latlng-jwt-secret>"
+jwt_algorithm = "HS256"
+jwt_issuer = "https://id.example.com"
+jwt_audience = "latlng"
+```
+
+```sh
+TOKEN="$(latlng-cli token create \
+  --config ./latlng.toml \
+  --subject dashboard-1 \
+  --ttl 24h \
+  --preset dashboard \
+  --collection 'fleet-*')"
+
+LATLNG_TOKEN="$TOKEN" latlng-cli collections
+latlng-cli token verify "$TOKEN" --config ./latlng.toml
+```
+
+External IdPs can be integrated through JWKS. In that mode the IdP issues access tokens,
+and `latlng-server` verifies them with `jwt_issuer`, `jwt_audience`, `jwt_algorithm`,
+and `jwks_url`. The access token must include `latlng_permissions` or `latlng_admin`.
+See [docs/auth.md](docs/auth.md#using-an-external-idp-with-jwks).
 
 Full auth/authz documentation, claim examples, and config reference:
 

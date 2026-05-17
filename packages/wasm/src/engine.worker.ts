@@ -13,7 +13,7 @@ function engine(): Promise<BrowserLatLng> {
   const wasmUrl =
     configuredWasmUrl ??
     new URL(["..", "wasm", "latlng_core_bg.wasm"].join("/"), import.meta.url);
-  enginePromise ??= init(wasmUrl).then(() => new BrowserLatLng());
+  enginePromise ??= init({ module_or_path: wasmUrl }).then(() => new BrowserLatLng());
   return enginePromise;
 }
 

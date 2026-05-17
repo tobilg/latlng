@@ -1,6 +1,6 @@
 {
   "name": "@latlng/example-wasm",
-  "version": "0.1.2",
+  "version": "0.1.3",
   "private": true,
   "description": "Static Vite demo site for the @latlng/wasm browser package",
   "type": "module",
