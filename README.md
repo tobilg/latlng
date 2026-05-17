@@ -95,10 +95,14 @@ Configuration, persistence, and release notes live in [docs/config.md](docs/conf
 
 ## Quickstart
 
+The commands below assume the release binaries `latlng-server` and `latlng-cli`
+are installed and available on `PATH`. Install them with Homebrew, Docker, or a
+GitHub release archive as described below.
+
 Start the native server:
 
 ```sh
-cargo run -p latlng-server
+latlng-server
 ```
 
 By default it listens on:
@@ -109,13 +113,13 @@ Cap'n Proto is disabled by default. Enable it when native Cap'n Proto clients or
 leader/follower replication are needed:
 
 ```sh
-cargo run -p latlng-server -- --capnp-enabled=true
+latlng-server --capnp-enabled=true
 ```
 
 The native server also supports JSON or TOML config files:
 
 ```sh
-cargo run -p latlng-server -- --config ./latlng.json
+latlng-server --config ./latlng.json
 ```
 
 The canonical generated OpenAPI v3 document for the native HTTP server is available at:
@@ -127,77 +131,77 @@ It describes the stable native HTTP surface with typed request and response sche
 The subscriber mailbox used for channel, WebSocket, Cap'n Proto, and webhook event delivery defaults to `4096` events per subscriber. You can override it with:
 
 ```sh
-LATLNG_SUBSCRIBER_QUEUE_CAPACITY=8192 cargo run -p latlng-server
-cargo run -p latlng-server -- --subscriber-queue-capacity 8192
+LATLNG_SUBSCRIBER_QUEUE_CAPACITY=8192 latlng-server
+latlng-server --subscriber-queue-capacity 8192
 ```
 
 The dedicated native core executor defaults to one worker per available CPU and a bounded queue sized at `threads * 64`. You can override it with:
 
 ```sh
-LATLNG_NATIVE_EXECUTOR_THREADS=8 LATLNG_NATIVE_EXECUTOR_QUEUE_LIMIT=512 cargo run -p latlng-server
-cargo run -p latlng-server -- --native-executor-threads 8 --native-executor-queue-limit 512
+LATLNG_NATIVE_EXECUTOR_THREADS=8 LATLNG_NATIVE_EXECUTOR_QUEUE_LIMIT=512 latlng-server
+latlng-server --native-executor-threads 8 --native-executor-queue-limit 512
 ```
 
 Webhook HTTP delivery uses a per-request timeout that defaults to `5000ms`. You can override it with:
 
 ```sh
-LATLNG_WEBHOOK_TIMEOUT_MS=10000 cargo run -p latlng-server
-cargo run -p latlng-server -- --webhook-timeout-ms 10000
+LATLNG_WEBHOOK_TIMEOUT_MS=10000 latlng-server
+latlng-server --webhook-timeout-ms 10000
 ```
 
 Webhook delivery concurrency is bounded and defaults to `128` in-flight HTTP deliveries. You can override it with:
 
 ```sh
-LATLNG_WEBHOOK_CONCURRENCY_LIMIT=256 cargo run -p latlng-server
-cargo run -p latlng-server -- --webhook-concurrency-limit 256
+LATLNG_WEBHOOK_CONCURRENCY_LIMIT=256 latlng-server
+latlng-server --webhook-concurrency-limit 256
 ```
 
 Durable webhook delivery also has queue and retry settings:
 
 ```sh
-LATLNG_WEBHOOK_QUEUE_PATH=./data/webhooks.sqlite cargo run -p latlng-server
-LATLNG_WEBHOOK_RETRY_COUNT=8 cargo run -p latlng-server
-LATLNG_WEBHOOK_RETRY_INITIAL_BACKOFF_MS=200 cargo run -p latlng-server
-LATLNG_WEBHOOK_RETRY_MAX_BACKOFF_MS=30000 cargo run -p latlng-server
-LATLNG_WEBHOOK_LEASE_MS=30000 cargo run -p latlng-server
+LATLNG_WEBHOOK_QUEUE_PATH=./data/webhooks.sqlite latlng-server
+LATLNG_WEBHOOK_RETRY_COUNT=8 latlng-server
+LATLNG_WEBHOOK_RETRY_INITIAL_BACKOFF_MS=200 latlng-server
+LATLNG_WEBHOOK_RETRY_MAX_BACKOFF_MS=30000 latlng-server
+LATLNG_WEBHOOK_LEASE_MS=30000 latlng-server
 ```
 
 Store and query a point through the CLI:
 
 ```sh
-cargo run -p latlng-cli -- --base-url http://127.0.0.1:7421 set-point fleet truck-1 52.52 13.405
-cargo run -p latlng-cli -- --base-url http://127.0.0.1:7421 get fleet truck-1
-cargo run -p latlng-cli -- --base-url http://127.0.0.1:7421 nearby fleet 52.52 13.405 500
-cargo run -p latlng-cli -- collection-create fleet
-cargo run -p latlng-cli -- fset fleet truck-1 speed 42
-cargo run -p latlng-cli -- fget fleet truck-1 speed
-cargo run -p latlng-cli -- expire fleet truck-1 300
-cargo run -p latlng-cli -- ttl fleet truck-1
-cargo run -p latlng-cli -- jset fleet truck-1 properties.status active
-cargo run -p latlng-cli -- jget fleet truck-1 properties.status
-cargo run -p latlng-cli -- del fleet truck-1
-cargo run -p latlng-cli -- timeout set 1.5
-cargo run -p latlng-cli -- readonly yes
-cargo run -p latlng-cli -- config-rewrite
+latlng-cli --base-url http://127.0.0.1:7421 set-point fleet truck-1 52.52 13.405
+latlng-cli --base-url http://127.0.0.1:7421 get fleet truck-1
+latlng-cli --base-url http://127.0.0.1:7421 nearby fleet 52.52 13.405 500
+latlng-cli collection-create fleet
+latlng-cli fset fleet truck-1 speed 42
+latlng-cli fget fleet truck-1 speed
+latlng-cli expire fleet truck-1 300
+latlng-cli ttl fleet truck-1
+latlng-cli jset fleet truck-1 properties.status active
+latlng-cli jget fleet truck-1 properties.status
+latlng-cli del fleet truck-1
+latlng-cli timeout set 1.5
+latlng-cli readonly yes
+latlng-cli config-rewrite
 ```
 
 Hook and channel geofences can be created from GeoJSON files. The file may include `properties.collection`, `properties.detect`, `properties.commands`, and `properties.mode`; otherwise pass `--collection`, `--detect`, `--commands`, or `--mode` on the CLI.
 
 ```sh
-cargo run -p latlng-cli -- hook-set fleet-hook https://example.com/hook --geojson ./geofence.geojson --collection fleet
-cargo run -p latlng-cli -- hooks
-cargo run -p latlng-cli -- hook-get fleet-hook
-cargo run -p latlng-cli -- channel-set fleet-channel --geojson ./geofence.geojson --collection fleet
-cargo run -p latlng-cli -- channels
-cargo run -p latlng-cli -- channel-del fleet-channel
+latlng-cli hook-set fleet-hook https://example.com/hook --geojson ./geofence.geojson --collection fleet
+latlng-cli hooks
+latlng-cli hook-get fleet-hook
+latlng-cli channel-set fleet-channel --geojson ./geofence.geojson --collection fleet
+latlng-cli channels
+latlng-cli channel-del fleet-channel
 ```
 
 Inspect and maintain an offline AOF file:
 
 ```sh
-cargo run -p latlng-cli -- aof-verify ./data/appendonly.aof
-cargo run -p latlng-cli -- aof-backup ./data/appendonly.aof ./backup/appendonly.backup.json
-cargo run -p latlng-cli -- aof-restore ./backup/appendonly.backup.json ./restore/appendonly.aof
+latlng-cli aof-verify ./data/appendonly.aof
+latlng-cli aof-backup ./data/appendonly.aof ./backup/appendonly.backup.json
+latlng-cli aof-restore ./backup/appendonly.backup.json ./restore/appendonly.aof
 ```
 
 Or use plain HTTP:
@@ -269,7 +273,7 @@ docker build -t latlng-server .
 ```
 
 Published release images are available from Docker Hub as `tobilg/latlng:latest`
-and versioned tags such as `tobilg/latlng:v0.1.2`.
+and versioned tags such as `tobilg/latlng:v0.1.3`.
 
 Run a single node from the published image with a mounted config file and persistent
 data volume:
@@ -590,7 +594,7 @@ Equivalent env/CLI overrides:
 LATLNG_AOF_WRITER_QUEUE_LIMIT=4096 \
 LATLNG_AOF_GROUP_COMMIT_DELAY_MS=1 \
 LATLNG_AOF_GROUP_COMMIT_MAX_REQUESTS=128 \
-cargo run -p latlng-server -- \
+latlng-server \
   --aof /var/lib/latlng/appendonly.aof \
   --aof-writer-queue-limit 4096 \
   --aof-group-commit-delay-ms 1 \
