@@ -40,7 +40,7 @@ ACT_RELEASE_EVENT ?= .github/act/release-tag-push.json
 	verify-release-binaries openapi homebrew-formula \
 	bench-server bench-server-capnp bench-server-aof bench-server-tile38 bench-server-write-heavy bench-server-aof-tuning bench-server-query-heavy bench-server-geofence-heavy bench-server-compare bench-server-compare-capnp bench-server-compare-tile38 \
 		sdk-install sdk-build sdk-docs sdk-typecheck sdk-test-unit sdk-test-integration sdk-test \
-	wasm-install wasm-build wasm-typecheck wasm-test wasm-pack-dry-run \
+	wasm-install wasm-build wasm-typecheck wasm-test wasm-test-built wasm-pack-dry-run \
 	example-wasm-install example-wasm-build example-wasm-typecheck example-wasm-preview example-wasm-deploy \
 	bump-version \
 		docker-build docker-build-prebuilt docker-build-prebuilt-local docker-up docker-down docker-up-replication docker-down-replication \
@@ -93,6 +93,7 @@ help:
 	'  make wasm-build           # npm run build in packages/wasm' \
 	'  make wasm-typecheck       # npm run typecheck in packages/wasm' \
 	'  make wasm-test            # npm run test in packages/wasm' \
+	'  make wasm-test-built      # run wasm tests against an existing build' \
 	'  make wasm-pack-dry-run    # npm pack --dry-run in packages/wasm' \
 	'' \
 	'Browser wasm example:' \
@@ -341,6 +342,9 @@ wasm-typecheck:
 
 wasm-test:
 	cd $(WASM_DIR) && $(NPM) run test
+
+wasm-test-built:
+	cd $(WASM_DIR) && $(NPM) exec -- vitest run
 
 wasm-pack-dry-run:
 	cd $(WASM_DIR) && $(NPM) --cache $(NPM_CACHE) pack --dry-run

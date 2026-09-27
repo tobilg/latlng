@@ -109,10 +109,22 @@ jobs:
           toolchain: 1.94.0
           targets: wasm32-unknown-unknown
 
+      - name: Cache wasm-bindgen CLI
+        id: wasm-bindgen-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/bin/wasm-bindgen
+            ~/.cargo/bin/wasm-bindgen-test-runner
+            ~/.cargo/bin/wasm2es6js
+          key: wasm-bindgen-cli-0.2.126-${{ runner.os }}-${{ runner.arch }}
+
       - name: Install wasm-bindgen CLI
-        run: |
-          cargo install wasm-bindgen-cli --version 0.2.126 --locked
-          wasm-bindgen --version
+        if: steps.wasm-bindgen-cache.outputs.cache-hit != 'true'
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+
+      - name: Show wasm-bindgen version
+        run: wasm-bindgen --version
 
       - name: Install wasm-opt
         run: |
@@ -130,10 +142,27 @@ jobs:
         run: make wasm-typecheck
 
       - name: Test browser wasm package
-        run: make wasm-test
+        run: make wasm-test-built
 
-      - name: Validate browser wasm package contents
-        run: make wasm-pack-dry-run
+      - name: Verify browser wasm package version matches tag
+        working-directory: packages/wasm
+        shell: bash
+        run: |
+          PACKAGE_VERSION="$(npm pkg get version | tr -d '"')"
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          test "$PACKAGE_VERSION" = "$TAG_VERSION"
+
+      # The tested build is packed here and published unchanged by wasm-release.
+      - name: Pack browser wasm package
+        working-directory: packages/wasm
+        run: npm pack
+
+      - name: Upload browser wasm npm package artifact
+        uses: actions/upload-artifact@v6
+        with:
+          name: latlng-wasm-npm-package
+          path: packages/wasm/latlng-wasm-*.tgz
+          if-no-files-found: error
 
   binaries:
     needs:
@@ -482,35 +511,17 @@ jobs:
         run: npm publish --provenance --access public
 
   wasm-release:
-    needs: binaries
+    needs:
+      - binaries
+      - typescript-wasm-test
     runs-on: ubuntu-latest
     if: startsWith(github.ref_name, 'v')
 
     steps:
-      - uses: actions/checkout@v6
-
       - uses: actions/setup-node@v6
         with:
           node-version: 24
           registry-url: https://registry.npmjs.org
-          cache: npm
-          cache-dependency-path: packages/wasm/package-lock.json
-
-      - uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: 1.94.0
-          targets: wasm32-unknown-unknown
-
-      - name: Install wasm-bindgen CLI
-        run: |
-          cargo install wasm-bindgen-cli --version 0.2.126 --locked
-          wasm-bindgen --version
-
-      - name: Install wasm-opt
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y binaryen
-          wasm-opt --version
 
       - name: Determine release mode
         id: release_mode
@@ -522,33 +533,13 @@ jobs:
             echo "publish=true" >> "$GITHUB_OUTPUT"
           fi
 
-      - name: Install browser wasm package dependencies
-        run: make wasm-install
-
-      - name: Build browser wasm package
-        run: make wasm-build
-
-      - name: Verify browser wasm package version matches tag
-        working-directory: packages/wasm
-        shell: bash
-        run: |
-          PACKAGE_VERSION="$(npm pkg get version | tr -d '"')"
-          TAG_VERSION="${GITHUB_REF_NAME#v}"
-          test "$PACKAGE_VERSION" = "$TAG_VERSION"
-
-      - name: Pack browser wasm package
-        working-directory: packages/wasm
-        run: npm pack
-
-      - name: Upload browser wasm npm package artifact
-        uses: actions/upload-artifact@v6
+      - name: Download tested browser wasm npm package
+        uses: actions/download-artifact@v8
         with:
           name: latlng-wasm-npm-package
-          path: packages/wasm/latlng-wasm-*.tgz
 
       - name: Publish browser wasm package to npm
         if: steps.release_mode.outputs.publish == 'true'
-        working-directory: packages/wasm
         env:
           NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: npm publish --provenance --access public
+        run: npm publish ./latlng-wasm-*.tgz --provenance --access public

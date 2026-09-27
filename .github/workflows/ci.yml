@@ -216,10 +216,22 @@ jobs:
           toolchain: 1.94.0
           targets: wasm32-unknown-unknown
 
+      - name: Cache wasm-bindgen CLI
+        id: wasm-bindgen-cache
+        uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/bin/wasm-bindgen
+            ~/.cargo/bin/wasm-bindgen-test-runner
+            ~/.cargo/bin/wasm2es6js
+          key: wasm-bindgen-cli-0.2.126-${{ runner.os }}-${{ runner.arch }}
+
       - name: Install wasm-bindgen CLI
-        run: |
-          cargo install wasm-bindgen-cli --version 0.2.126 --locked
-          wasm-bindgen --version
+        if: steps.wasm-bindgen-cache.outputs.cache-hit != 'true'
+        run: cargo install wasm-bindgen-cli --version 0.2.126 --locked
+
+      - name: Show wasm-bindgen version
+        run: wasm-bindgen --version
 
       - name: Install wasm-opt
         run: |
@@ -237,7 +249,7 @@ jobs:
         run: make wasm-typecheck
 
       - name: Test browser wasm package
-        run: make wasm-test
+        run: make wasm-test-built
 
       - name: Validate browser wasm package contents
         run: make wasm-pack-dry-run
