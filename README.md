@@ -293,7 +293,7 @@ docker build -t latlng-server .
 ```
 
 Published release images are available from Docker Hub as `tobilg/latlng:latest`
-and versioned tags such as `tobilg/latlng:v0.1.3`.
+and versioned tags such as `tobilg/latlng:v0.2.0`.
 
 Run a single node from the published image with a mounted config file and persistent
 data volume:
