@@ -107,7 +107,7 @@ async fn client_loop<S>(
                 match message {
                     Message::Text(payload) => {
                         let Ok(command) = serde_json::from_str::<WsCommand>(&payload) else {
-                            if send_json(&mut socket, serde_json::json!({ "error": "invalid websocket command" })).await.is_err() {
+                            if send_error(&mut socket, "bad_request", "invalid websocket command").await.is_err() {
                                 break;
                             }
                             continue;
@@ -126,7 +126,7 @@ async fn client_loop<S>(
                                     Err(_) => {
                                         principal = None;
                                         warn!(request_id = %request_id, connection_id = %connection_id, "websocket authentication failed");
-                                        if send_json(&mut socket, serde_json::json!({ "error": "unauthorized" })).await.is_err() {
+                                        if send_error(&mut socket, "unauthorized", "unauthorized").await.is_err() {
                                             break;
                                         }
                                     }
@@ -140,7 +140,7 @@ async fn client_loop<S>(
                             WsCommand::Quit => break,
                             WsCommand::Subscribe { channels } => {
                                 let Some(current_principal) = principal.as_ref() else {
-                                    if send_json(&mut socket, serde_json::json!({ "error": "unauthorized" })).await.is_err() {
+                                    if send_error(&mut socket, "unauthorized", "unauthorized").await.is_err() {
                                         break;
                                     }
                                     continue;
@@ -168,7 +168,7 @@ async fn client_loop<S>(
                                         &channel.def.collection,
                                     )
                                 }) {
-                                    if send_json(&mut socket, serde_json::json!({ "error": "forbidden" })).await.is_err() {
+                                    if send_error(&mut socket, "forbidden", "forbidden").await.is_err() {
                                         break;
                                     }
                                     continue;
@@ -199,7 +199,7 @@ async fn client_loop<S>(
                             }
                             WsCommand::Psubscribe { patterns } => {
                                 let Some(current_principal) = principal.as_ref() else {
-                                    if send_json(&mut socket, serde_json::json!({ "error": "unauthorized" })).await.is_err() {
+                                    if send_error(&mut socket, "unauthorized", "unauthorized").await.is_err() {
                                         break;
                                     }
                                     continue;
@@ -207,7 +207,7 @@ async fn client_loop<S>(
                                 if !current_principal.any_collection_permission(AuthAction::SubscriptionsRead)
                                     && !current_principal.is_admin()
                                 {
-                                    if send_json(&mut socket, serde_json::json!({ "error": "forbidden" })).await.is_err() {
+                                    if send_error(&mut socket, "forbidden", "forbidden").await.is_err() {
                                         break;
                                     }
                                     continue;
@@ -312,6 +312,12 @@ async fn authorize(
             AuthError::Unauthorized => StatusCode::UNAUTHORIZED,
             _ => StatusCode::INTERNAL_SERVER_ERROR,
         })
+}
+
+/// Sends an error frame. `code` is a stable machine-readable identifier;
+/// `error` stays human readable.
+async fn send_error(socket: &mut WebSocket, code: &str, error: &str) -> Result<(), axum::Error> {
+    send_json(socket, serde_json::json!({ "error": error, "code": code })).await
 }
 
 async fn send_json(socket: &mut WebSocket, value: serde_json::Value) -> Result<(), axum::Error> {
@@ -470,6 +476,7 @@ mod tests {
             .unwrap();
         let denied_text = denied.into_text().unwrap();
         assert!(denied_text.contains("\"error\":\"forbidden\""));
+        assert!(denied_text.contains("\"code\":\"forbidden\""));
 
         server.abort();
     }

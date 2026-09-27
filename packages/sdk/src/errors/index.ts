@@ -71,6 +71,18 @@ export class HttpError extends LatLngError {
 export class AuthError extends HttpError {}
 
 /**
+ * HTTP error raised when the request is invalid (status 400), for example
+ * malformed geometry, an invalid filter, or an unknown request field.
+ */
+export class BadRequestError extends HttpError {}
+
+/**
+ * HTTP error raised when a collection, object, hook, or channel does not exist
+ * (status 404).
+ */
+export class NotFoundError extends HttpError {}
+
+/**
  * HTTP error raised when the server is temporarily unavailable.
  */
 export class ServerUnavailableError extends HttpError {}

@@ -57,24 +57,27 @@ pub enum WhereComparison {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WhereFilter {
     pub field: String,
     pub comparison: WhereComparison,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WhereInFilter {
     pub field: String,
     pub values: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct WhereExprFilter {
     pub expression: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(default)]
+#[serde(default, deny_unknown_fields)]
 pub struct SearchOptions {
     pub cursor: u32,
     pub limit: u32,
@@ -114,6 +117,20 @@ impl SearchOptions {
             && self.nofields
             && matches!(self.output, OutputFormat::Ids)
             && !self.clip
+    }
+
+    /// Checks every filter up front, so an invalid regex or expression is
+    /// rejected even when no object would be evaluated against it.
+    pub fn validate(&self) -> IndexResult<()> {
+        for filter in &self.where_filters {
+            if let WhereComparison::Regex(pattern) = &filter.comparison {
+                Regex::new(pattern).map_err(|error| IndexError::Regex(error.to_string()))?;
+            }
+        }
+        for filter in &self.where_expr_filters {
+            validate_expression(&filter.expression)?;
+        }
+        Ok(())
     }
 
     pub fn has_filters(&self) -> bool {
@@ -778,6 +795,34 @@ fn evaluate_expression(object: &Object, expression: &str) -> IndexResult<bool> {
     }
 }
 
+fn validate_expression(expression: &str) -> IndexResult<()> {
+    let mut any_clause = false;
+    for clause in expression
+        .split("||")
+        .flat_map(|branch| branch.split("&&"))
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+    {
+        any_clause = true;
+        let Some(operator) = ["=~", ">=", "<=", "==", "!=", ">", "<"]
+            .into_iter()
+            .find(|operator| clause.contains(operator))
+        else {
+            return Err(IndexError::InvalidExpression(clause.to_owned()));
+        };
+        if operator == "=~" {
+            let (_, right) = clause.split_once(operator).unwrap_or_default();
+            Regex::new(&trim_quotes(right))
+                .map_err(|error| IndexError::Regex(error.to_string()))?;
+        }
+    }
+    if any_clause {
+        Ok(())
+    } else {
+        Err(IndexError::InvalidExpression(expression.to_owned()))
+    }
+}
+
 fn evaluate_clause(object: &Object, clause: &str) -> IndexResult<bool> {
     for operator in ["=~", ">=", "<=", "==", "!=", ">", "<"] {
         if let Some((left, right)) = clause.split_once(operator) {
@@ -865,12 +910,15 @@ fn resolve_value(object: &Object, path: &str) -> Option<ResolvedValue> {
         return Some(json_value_to_resolved(value));
     }
 
+    // Anything that does not resolve reads as the number 0, so
+    // a missing field and a field set to 0 behave the same in filters.
     object
         .geo
         .json_value()
         .and_then(|value| get_json_path(value, path))
         .cloned()
         .map(json_value_to_resolved)
+        .or(Some(ResolvedValue::Number(0.0)))
 }
 
 fn json_value_to_resolved(value: serde_json::Value) -> ResolvedValue {

@@ -10,11 +10,12 @@ use glob_match::glob_match;
 use hashbrown::HashMap;
 use latlng_geo::{
     Area, BoundingBox, FieldMap, FieldValue, GeoError, GeoType, Object, delete_json_path,
-    get_json_path, set_json_path,
+    get_json_path, set_json_path, validate_lat_lon, validate_meters,
 };
 use latlng_geofence::{
     ChannelDef, DEFAULT_SUBSCRIBER_QUEUE_CAPACITY, GeofenceDef, GeofenceEvent,
-    GeofenceEventReceiver, GeofenceRegistry, HookDef, HookInfo, MutationCommand, MutationEvent,
+    GeofenceEventReceiver, GeofenceQuery, GeofenceRegistry, HookDef, HookInfo, MutationCommand,
+    MutationEvent,
 };
 #[cfg(feature = "parallel")]
 use latlng_index::{
@@ -64,7 +65,38 @@ pub enum CoreError {
     #[error("invalid command payload: {0}")]
     Codec(String),
     #[error("{0}")]
+    Invalid(String),
+    #[error("{0}")]
     Message(String),
+}
+
+/// Transport-neutral classification of a [`CoreError`], used by the HTTP,
+/// WebSocket and Cap'n Proto layers to pick status or error codes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ErrorKind {
+    /// The referenced collection or object does not exist.
+    NotFound,
+    /// The request is invalid: bad geometry, filter, expression or payload.
+    BadRequest,
+    /// The server is in read-only mode.
+    ReadOnly,
+    /// A storage or internal failure; not the caller's fault.
+    Internal,
+}
+
+impl CoreError {
+    pub fn kind(&self) -> ErrorKind {
+        match self {
+            Self::CollectionNotFound(_) | Self::ObjectNotFound { .. } => ErrorKind::NotFound,
+            Self::Geo(_) | Self::Index(_) | Self::Invalid(_) => ErrorKind::BadRequest,
+            Self::ReadOnly => ErrorKind::ReadOnly,
+            // Codec errors come from encoding or decoding the command log, never
+            // from client input.
+            Self::Storage(_) | Self::MissingStorage | Self::Codec(_) | Self::Message(_) => {
+                ErrorKind::Internal
+            }
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -119,6 +151,7 @@ pub fn default_webhook_retry_count() -> u32 {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct FieldEntry {
     pub name: String,
     pub value: FieldValue,
@@ -166,6 +199,7 @@ impl Default for GetOptions {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct NearbyQuery {
     pub lat: f64,
     pub lon: f64,
@@ -330,6 +364,9 @@ pub struct Collection {
     objects: HashMap<String, Object>,
     spatial_index: SpatialIndex,
     field_indexes: FieldIndexes,
+    /// Objects with a TTL, ordered by deadline so expiry can stop at the
+    /// first object that has not expired yet.
+    expirations: BTreeSet<(u64, String)>,
 }
 
 impl Collection {
@@ -339,16 +376,23 @@ impl Collection {
             objects: HashMap::new(),
             spatial_index: SpatialIndex::new(),
             field_indexes: FieldIndexes::default(),
+            expirations: BTreeSet::new(),
         }
     }
 
     fn upsert(&mut self, object: Object) -> Result<()> {
         if let Some(previous) = self.objects.get(&object.id) {
             self.field_indexes.remove_object(previous);
+            if let Some(deadline) = previous.expires_at {
+                self.expirations.remove(&(deadline, object.id.clone()));
+            }
         }
         self.spatial_index.remove(&object.id);
         self.spatial_index.insert(object.id.clone(), &object.geo)?;
         self.field_indexes.insert_object(&object);
+        if let Some(deadline) = object.expires_at {
+            self.expirations.insert((deadline, object.id.clone()));
+        }
         self.objects.insert(object.id.clone(), object);
         Ok(())
     }
@@ -358,8 +402,59 @@ impl Collection {
         let removed = self.objects.remove(id);
         if let Some(object) = removed.as_ref() {
             self.field_indexes.remove_object(object);
+            if let Some(deadline) = object.expires_at {
+                self.expirations.remove(&(deadline, object.id.clone()));
+            }
         }
         removed
+    }
+
+    /// Refreshes an object's spatial index entry after an in-place edit.
+    /// Used on replay, where a legacy edit may have produced a geometry that
+    /// cannot be indexed; such an object is left out of the spatial index
+    /// instead of failing start-up.
+    fn reindex_spatial(&mut self, id: &str) {
+        self.spatial_index.remove(id);
+        if let Some(object) = self.objects.get(id) {
+            let _ = self.spatial_index.insert(id.to_owned(), &object.geo);
+        }
+    }
+
+    /// Replaces an object's geometry and refreshes its spatial index entry.
+    fn replace_geo(&mut self, id: &str, geo: GeoType) -> Result<bool> {
+        let Some(object) = self.objects.get_mut(id) else {
+            return Ok(false);
+        };
+        object.geo = geo;
+        self.spatial_index.remove(id);
+        self.spatial_index.insert(id.to_owned(), &object.geo)?;
+        Ok(true)
+    }
+
+    /// Sets or clears an object's deadline, keeping the expiry index in sync.
+    /// Returns `false` when the object does not exist.
+    fn set_expiry(&mut self, id: &str, expires_at: Option<u64>) -> bool {
+        let Some(object) = self.objects.get_mut(id) else {
+            return false;
+        };
+        if let Some(previous) = object.expires_at {
+            self.expirations.remove(&(previous, id.to_owned()));
+        }
+        object.expires_at = expires_at;
+        if let Some(deadline) = expires_at {
+            self.expirations.insert((deadline, id.to_owned()));
+        }
+        true
+    }
+
+    /// Ids whose deadline is at or before `now_ms`, oldest first.
+    fn due_expirations(&self, now_ms: u64, max: usize) -> Vec<String> {
+        self.expirations
+            .iter()
+            .take_while(|(deadline, _)| *deadline <= now_ms)
+            .take(max)
+            .map(|(_, id)| id.clone())
+            .collect()
     }
 
     fn insert_fields(&mut self, id: &str, fields: &[FieldEntry]) -> bool {
@@ -367,11 +462,7 @@ impl Collection {
             return false;
         };
         self.field_indexes.remove_object(object);
-        for field in fields {
-            object
-                .fields
-                .insert(field.name.clone(), field.value.clone());
-        }
+        apply_field_updates(&mut object.fields, fields);
         self.field_indexes.insert_object(object);
         true
     }
@@ -552,7 +643,7 @@ impl FieldIndexes {
         filter: &latlng_index::WhereFilter,
         visit: &mut impl FnMut(&str) -> bool,
     ) -> bool {
-        if !is_top_level_field(&filter.field) {
+        if !is_top_level_field(&filter.field) || where_filter_matches_zero(filter) {
             return false;
         }
         match &filter.comparison {
@@ -606,7 +697,7 @@ impl FieldIndexes {
     }
 
     fn ids_for_where_filter(&self, filter: &latlng_index::WhereFilter) -> Option<BTreeSet<String>> {
-        if !is_top_level_field(&filter.field) {
+        if !is_top_level_field(&filter.field) || where_filter_matches_zero(filter) {
             return None;
         }
         match &filter.comparison {
@@ -635,7 +726,12 @@ impl FieldIndexes {
         &self,
         filter: &latlng_index::WhereInFilter,
     ) -> Option<BTreeSet<String>> {
-        if !is_top_level_field(&filter.field) {
+        if !is_top_level_field(&filter.field)
+            || filter
+                .values
+                .iter()
+                .any(|value| value.parse::<f64>().is_ok_and(|number| number == 0.0))
+        {
             return None;
         }
         let mut out = BTreeSet::new();
@@ -656,6 +752,16 @@ impl FieldIndexes {
             }
         }
         Some(out)
+    }
+}
+
+/// A missing field reads as 0 in filters but is absent from the field
+/// indexes, so filters that can match 0 must fall back to a full evaluation.
+fn where_filter_matches_zero(filter: &latlng_index::WhereFilter) -> bool {
+    match &filter.comparison {
+        WhereComparison::Range { min, max } => *min <= 0.0 && 0.0 <= *max,
+        WhereComparison::EqualsText(expected) => expected.parse::<f64>().is_ok_and(|n| n == 0.0),
+        WhereComparison::Regex(_) => true,
     }
 }
 
@@ -759,6 +865,7 @@ impl<P: Platform, S: StorageBackend> LatLngBuilder<P, S> {
             storage,
             config: P::new_rwlock(self.config),
             next_sequence: P::new_rwlock(0),
+            expired_objects_total: std::sync::atomic::AtomicU64::new(0),
             _platform: PhantomData,
         };
         db.gc();
@@ -774,6 +881,7 @@ pub struct LatLng<P: Platform, S: StorageBackend> {
     storage: S,
     config: P::RwLock<Config>,
     next_sequence: P::RwLock<u64>,
+    expired_objects_total: std::sync::atomic::AtomicU64,
     _platform: PhantomData<P>,
 }
 
@@ -1412,6 +1520,549 @@ mod tests {
         assert_eq!(hooks.len(), 1);
         assert_eq!(hooks[0].name, "fleet-hook");
         assert_eq!(hooks[0].collection, "fleet");
+    }
+
+    fn reference_fence_def() -> GeofenceDef {
+        GeofenceDef {
+            collection: "fleet".to_owned(),
+            query: GeofenceQuery::Within {
+                area: Area::Reference {
+                    collection: "zones".to_owned(),
+                    id: "z1".to_owned(),
+                },
+                options: SearchOptions::default(),
+            },
+            detect: vec![DetectType::Enter],
+            commands: vec![MutationCommand::Set],
+        }
+    }
+
+    fn set_point(id: &str, lat: f64, lon: f64) -> SetRequest {
+        SetRequest {
+            collection: "fleet".to_owned(),
+            id: id.to_owned(),
+            object: GeoType::point(lat, lon),
+            fields: Vec::new(),
+            expire_seconds: None,
+            condition: SetCondition::Always,
+        }
+    }
+
+    #[test]
+    fn reference_area_fences_are_rejected_and_writes_keep_working() {
+        let db = db();
+        assert!(matches!(
+            db.sethook("ref", "http://127.0.0.1:9/x", reference_fence_def()),
+            Err(super::CoreError::Invalid(_))
+        ));
+        assert!(matches!(
+            db.setchan("ref", reference_fence_def()),
+            Err(super::CoreError::Invalid(_))
+        ));
+        assert!(db.hooks("*").unwrap().is_empty());
+        assert!(db.chans("*").unwrap().is_empty());
+        db.set(set_point("v1", 10.0, 10.0)).unwrap();
+    }
+
+    #[test]
+    fn legacy_reference_fences_are_skipped_on_replay() {
+        let db = db_from_records(&[
+            LogRecord::Command(Command::SetHook {
+                name: "ref-hook".to_owned(),
+                endpoint: "http://127.0.0.1:9/x".to_owned(),
+                def: reference_fence_def(),
+            }),
+            LogRecord::Command(Command::SetChannel {
+                name: "ref-chan".to_owned(),
+                def: reference_fence_def(),
+            }),
+        ]);
+        assert!(db.hooks("*").unwrap().is_empty());
+        assert!(db.chans("*").unwrap().is_empty());
+        db.set(set_point("v1", 10.0, 10.0)).unwrap();
+        assert!(
+            db.get("fleet", "v1", GetOptions::default())
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn out_of_range_writes_are_rejected_but_replay_keeps_existing_data() {
+        let db = db();
+        assert!(matches!(
+            db.set(set_point("bad", 999.0, 9.99)),
+            Err(super::CoreError::Geo(_))
+        ));
+        assert!(!db.exists("fleet", "bad").unwrap());
+
+        let replayed = db_from_records(&[LogRecord::Command(Command::SetPersisted(
+            PersistedSetRecord {
+                collection: "fleet".to_owned(),
+                id: "legacy".to_owned(),
+                object: GeoType::point(999.0, 9.99),
+                fields: Vec::new(),
+                expires_at_ms: None,
+            },
+        ))]);
+        assert!(replayed.exists("fleet", "legacy").unwrap());
+        replayed.set(set_point("v1", 10.0, 10.0)).unwrap();
+    }
+
+    fn expiry_index_len(db: &LatLng<NativePlatform, MemoryBackend>, collection: &str) -> usize {
+        let collections = db.collections.read().unwrap_or_else(|p| p.into_inner());
+        collections
+            .get(collection)
+            .map(|handle| {
+                handle
+                    .read()
+                    .unwrap_or_else(|p| p.into_inner())
+                    .collection
+                    .expirations
+                    .len()
+            })
+            .unwrap_or(0)
+    }
+
+    fn object_in_memory(db: &LatLng<NativePlatform, MemoryBackend>, id: &str) -> bool {
+        let collections = db.collections.read().unwrap_or_else(|p| p.into_inner());
+        collections.get("fleet").is_some_and(|handle| {
+            handle
+                .read()
+                .unwrap_or_else(|p| p.into_inner())
+                .collection
+                .objects
+                .contains_key(id)
+        })
+    }
+
+    #[test]
+    fn expire_due_deletes_through_the_delete_path_and_emits_del_events() {
+        let db = db();
+        db.setchan(
+            "zone",
+            GeofenceDef {
+                collection: "fleet".to_owned(),
+                query: GeofenceQuery::Nearby {
+                    lat: 52.52,
+                    lon: 13.405,
+                    meters: 500.0,
+                    options: SearchOptions::default(),
+                },
+                detect: Vec::new(),
+                commands: vec![MutationCommand::Del],
+            },
+        )
+        .unwrap();
+        let mut receiver = db.subscribe(&["zone"]);
+        db.set(SetRequest {
+            expire_seconds: Some(1),
+            ..set_point("ttl", 52.52, 13.405)
+        })
+        .unwrap();
+        db.set(set_point("forever", 52.52, 13.405)).unwrap();
+        assert!(receiver.try_recv().is_none());
+
+        assert_eq!(db.expire_due(now_millis(), usize::MAX).unwrap(), 0);
+        let later = now_millis() + 5_000;
+        assert_eq!(db.expire_due(later, usize::MAX).unwrap(), 1);
+        assert_eq!(db.expired_objects_total(), 1);
+
+        let event = receiver.try_recv().expect("expected a Del event");
+        assert_eq!(event.command, MutationCommand::Del);
+        assert_eq!(event.id, "ttl");
+        assert!(receiver.try_recv().is_none());
+        assert!(!object_in_memory(&db, "ttl"));
+        assert!(object_in_memory(&db, "forever"));
+        assert_eq!(expiry_index_len(&db, "fleet"), 0);
+        assert!(db.next_expiry_ms().is_none());
+    }
+
+    #[test]
+    fn expiry_index_tracks_overwrites_expire_and_persist() {
+        let db = db();
+        db.set(SetRequest {
+            expire_seconds: Some(1),
+            ..set_point("a", 1.0, 1.0)
+        })
+        .unwrap();
+        assert_eq!(expiry_index_len(&db, "fleet"), 1);
+        // A SET without a TTL clears it.
+        db.set(set_point("a", 1.0, 1.0)).unwrap();
+        assert_eq!(expiry_index_len(&db, "fleet"), 0);
+
+        db.expire("fleet", "a", 1).unwrap();
+        db.expire("fleet", "a", 2).unwrap();
+        assert_eq!(expiry_index_len(&db, "fleet"), 1);
+        db.persist("fleet", "a").unwrap();
+        assert_eq!(expiry_index_len(&db, "fleet"), 0);
+        assert_eq!(db.expire_due(now_millis() + 5_000, usize::MAX).unwrap(), 0);
+
+        db.expire("fleet", "a", 1).unwrap();
+        db.del("fleet", "a").unwrap();
+        assert_eq!(expiry_index_len(&db, "fleet"), 0);
+    }
+
+    #[test]
+    fn expire_due_respects_batch_limit_and_read_only() {
+        let db = db();
+        for id in ["a", "b", "c"] {
+            db.set(SetRequest {
+                expire_seconds: Some(1),
+                ..set_point(id, 1.0, 1.0)
+            })
+            .unwrap();
+        }
+        let later = now_millis() + 5_000;
+        assert!(db.due_expirations(now_millis(), 10).is_empty());
+        assert_eq!(db.due_expirations(later, 10).len(), 3);
+        assert_eq!(db.due_expirations(later, 2).len(), 2);
+        assert_eq!(db.expire_due(later, 2).unwrap(), 2);
+        db.config().write().unwrap().read_only = true;
+        assert_eq!(db.expire_due(later, usize::MAX).unwrap(), 0);
+        db.config().write().unwrap().read_only = false;
+        assert_eq!(db.expire_due(later, usize::MAX).unwrap(), 1);
+    }
+
+    fn set_geojson_point(db: &LatLng<NativePlatform, MemoryBackend>, id: &str, lon: f64, lat: f64) {
+        db.set(SetRequest {
+            object: GeoType::GeoJson(serde_json::json!({
+                "type": "Feature",
+                "properties": {"name": "a"},
+                "geometry": {"type": "Point", "coordinates": [lon, lat]}
+            })),
+            ..set_point(id, 0.0, 0.0)
+        })
+        .unwrap();
+    }
+
+    fn ids_within(
+        db: &LatLng<NativePlatform, MemoryBackend>,
+        min_lon: f64,
+        max_lon: f64,
+    ) -> Vec<String> {
+        db.within(
+            "fleet",
+            Area::Bounds(BoundingBox {
+                min_lat: -10.0,
+                min_lon,
+                max_lat: 10.0,
+                max_lon,
+            }),
+            SearchOptions::default(),
+        )
+        .unwrap()
+        .results
+        .into_iter()
+        .map(|item| item.id)
+        .collect()
+    }
+
+    #[test]
+    fn jset_validates_before_logging_and_reindexes_geometry() {
+        let db = db();
+        set_geojson_point(&db, "g", 1.0, 1.0);
+        let sequence = db.last_sequence();
+
+        // Out-of-range coordinates, broken geometry, and bad paths are
+        // rejected without logging anything or changing the object.
+        assert!(matches!(
+            db.jset("fleet", "g", "geometry.coordinates.1", "999", true),
+            Err(super::CoreError::Geo(_))
+        ));
+        assert!(
+            db.jset("fleet", "g", "geometry.coordinates", "\"x\"", true)
+                .is_err()
+        );
+        assert!(db.jdel("fleet", "g", "geometry.coordinates").is_err());
+        assert_eq!(db.last_sequence(), sequence);
+        assert_eq!(
+            db.jget("fleet", "g", "geometry.coordinates")
+                .unwrap()
+                .as_deref(),
+            Some("[1.0,1.0]")
+        );
+
+        // A valid coordinate edit moves the object in the spatial index.
+        assert_eq!(ids_within(&db, 0.0, 2.0), vec!["g".to_owned()]);
+        db.jset("fleet", "g", "geometry.coordinates.0", "5", true)
+            .unwrap();
+        assert!(ids_within(&db, 0.0, 2.0).is_empty());
+        assert_eq!(ids_within(&db, 4.0, 6.0), vec!["g".to_owned()]);
+
+        // Property edits keep working.
+        db.jset("fleet", "g", "properties.name", "b", false)
+            .unwrap();
+        assert!(db.jdel("fleet", "g", "properties.name").unwrap());
+        assert!(!db.jdel("fleet", "g", "properties.name").unwrap());
+    }
+
+    #[test]
+    fn replayed_jset_reindexes_and_tolerates_legacy_invalid_edits() {
+        let object = GeoType::GeoJson(serde_json::json!({
+            "type": "Feature",
+            "properties": {},
+            "geometry": {"type": "Point", "coordinates": [1.0, 1.0]}
+        }));
+        let record = |id: &str| {
+            LogRecord::Command(Command::SetPersisted(PersistedSetRecord {
+                collection: "fleet".to_owned(),
+                id: id.to_owned(),
+                object: object.clone(),
+                fields: Vec::new(),
+                expires_at_ms: None,
+            }))
+        };
+        let db = db_from_records(&[
+            record("moved"),
+            record("broken"),
+            LogRecord::Command(Command::Jset {
+                collection: "fleet".to_owned(),
+                id: "moved".to_owned(),
+                path: "geometry.coordinates.0".to_owned(),
+                value: "5".to_owned(),
+                raw: true,
+            }),
+            LogRecord::Command(Command::Jset {
+                collection: "fleet".to_owned(),
+                id: "broken".to_owned(),
+                path: "geometry.coordinates".to_owned(),
+                value: "\"x\"".to_owned(),
+                raw: true,
+            }),
+        ]);
+        assert_eq!(ids_within(&db, 4.0, 6.0), vec!["moved".to_owned()]);
+        assert!(db.exists("fleet", "broken").unwrap());
+        db.set(set_point("v1", 1.0, 1.0)).unwrap();
+    }
+
+    fn number(name: &str, value: f64) -> FieldEntry {
+        FieldEntry {
+            name: name.to_owned(),
+            value: FieldValue::Number(value),
+        }
+    }
+
+    fn fields_of(
+        db: &LatLng<NativePlatform, MemoryBackend>,
+        id: &str,
+    ) -> Vec<(String, FieldValue)> {
+        db.get(
+            "fleet",
+            id,
+            GetOptions {
+                with_fields: true,
+                ..GetOptions::default()
+            },
+        )
+        .unwrap()
+        .unwrap()
+        .fields
+        .iter()
+        .map(|(name, value)| (name.to_owned(), value.clone()))
+        .collect()
+    }
+
+    fn with_fields(id: &str, fields: Vec<FieldEntry>) -> SetRequest {
+        SetRequest {
+            fields,
+            ..set_point(id, 33.0, -115.0)
+        }
+    }
+
+    #[test]
+    fn set_merges_fields_and_zero_deletes() {
+        let db = db();
+        let n = |name: &str, value: f64| (name.to_owned(), FieldValue::Number(value));
+        db.set(with_fields("id", vec![number("a", 1.0)])).unwrap();
+        assert_eq!(fields_of(&db, "id"), vec![n("a", 1.0)]);
+        db.set(with_fields("id", vec![number("a", 1.0), number("b", 2.0)]))
+            .unwrap();
+        db.set(with_fields("id", vec![number("b", 2.0)])).unwrap();
+        assert_eq!(fields_of(&db, "id"), vec![n("a", 1.0), n("b", 2.0)]);
+        db.set(with_fields(
+            "id",
+            vec![number("b", 2.0), number("a", 1.0), number("c", 3.0)],
+        ))
+        .unwrap();
+        assert_eq!(
+            fields_of(&db, "id"),
+            vec![n("a", 1.0), n("b", 2.0), n("c", 3.0)]
+        );
+
+        // A position-only update keeps every field.
+        db.set(set_point("id", 34.0, -116.0)).unwrap();
+        assert_eq!(fields_of(&db, "id").len(), 3);
+
+        // Setting a field to 0 removes it, in SET and in FSET.
+        db.set(with_fields("id", vec![number("a", 0.0)])).unwrap();
+        assert_eq!(fields_of(&db, "id"), vec![n("b", 2.0), n("c", 3.0)]);
+        db.fset("fleet", "id", &[number("b", 0.0), number("d", 4.0)], false)
+            .unwrap();
+        assert_eq!(fields_of(&db, "id"), vec![n("c", 3.0), n("d", 4.0)]);
+
+        // A zero field on a new object is simply not stored.
+        db.set(with_fields("new", vec![number("speed", 0.0)]))
+            .unwrap();
+        assert!(fields_of(&db, "new").is_empty());
+
+        // The log records the merged result, so replay reproduces it.
+        let replayed = db_from_records(&persisted_log_records(&db));
+        assert_eq!(fields_of(&replayed, "id"), vec![n("c", 3.0), n("d", 4.0)]);
+        assert!(fields_of(&replayed, "new").is_empty());
+    }
+
+    #[test]
+    fn set_still_replaces_the_ttl() {
+        let db = db();
+        db.set(SetRequest {
+            expire_seconds: Some(60),
+            ..with_fields("id", vec![number("a", 1.0)])
+        })
+        .unwrap();
+        assert!(db.ttl("fleet", "id").unwrap().is_some());
+        db.set(set_point("id", 1.0, 1.0)).unwrap();
+        assert_eq!(db.ttl("fleet", "id").unwrap(), None);
+        assert_eq!(fields_of(&db, "id").len(), 1);
+    }
+
+    #[test]
+    fn missing_fields_read_as_zero_in_filters() {
+        let db = db();
+        db.set(with_fields("moving", vec![number("speed", 5.0)]))
+            .unwrap();
+        db.set(set_point("parked", 33.0, -115.0)).unwrap();
+        let ids = |options: SearchOptions| {
+            let mut ids = db
+                .scan("fleet", options)
+                .unwrap()
+                .results
+                .into_iter()
+                .map(|item| item.id)
+                .collect::<Vec<_>>();
+            ids.sort();
+            ids
+        };
+        let range = |min: f64, max: f64| SearchOptions {
+            where_filters: vec![WhereFilter {
+                field: "speed".to_owned(),
+                comparison: WhereComparison::Range { min, max },
+            }],
+            ..SearchOptions::default()
+        };
+        assert_eq!(ids(range(0.0, 0.0)), vec!["parked"]);
+        assert_eq!(ids(range(0.0, 10.0)), vec!["moving", "parked"]);
+        assert_eq!(ids(range(1.0, 10.0)), vec!["moving"]);
+        // The indexed fast path must agree.
+        assert_eq!(
+            ids(SearchOptions {
+                nofields: true,
+                include_count: false,
+                output: OutputFormat::Ids,
+                ..range(0.0, 0.0)
+            }),
+            vec!["parked"]
+        );
+        assert_eq!(
+            ids(SearchOptions {
+                where_in_filters: vec![latlng_index::WhereInFilter {
+                    field: "speed".to_owned(),
+                    values: vec!["0".to_owned()],
+                }],
+                ..SearchOptions::default()
+            }),
+            vec!["parked"]
+        );
+        assert_eq!(
+            ids(SearchOptions {
+                where_expr_filters: vec![latlng_index::WhereExprFilter {
+                    expression: "speed == 0".to_owned(),
+                }],
+                ..SearchOptions::default()
+            }),
+            vec!["parked"]
+        );
+    }
+
+    #[test]
+    fn field_filtered_fence_keeps_matching_after_position_only_update() {
+        let db = db();
+        db.setchan(
+            "fast",
+            GeofenceDef {
+                collection: "fleet".to_owned(),
+                query: GeofenceQuery::Nearby {
+                    lat: 33.0,
+                    lon: -115.0,
+                    meters: 10_000.0,
+                    options: SearchOptions {
+                        where_filters: vec![WhereFilter {
+                            field: "speed".to_owned(),
+                            comparison: WhereComparison::Range {
+                                min: 10.0,
+                                max: 100.0,
+                            },
+                        }],
+                        ..SearchOptions::default()
+                    },
+                },
+                detect: Vec::new(),
+                commands: vec![MutationCommand::Set],
+            },
+        )
+        .unwrap();
+        let mut receiver = db.subscribe(&["fast"]);
+        db.set(with_fields("truck", vec![number("speed", 50.0)]))
+            .unwrap();
+        assert_eq!(receiver.try_recv().unwrap().detect, DetectType::Enter);
+        db.set(set_point("truck", 33.001, -115.001)).unwrap();
+        assert_eq!(receiver.try_recv().unwrap().detect, DetectType::Inside);
+    }
+
+    #[test]
+    fn jset_clears_ttl_and_keeps_fields() {
+        let db = db();
+        db.set(SetRequest {
+            object: GeoType::GeoJson(serde_json::json!({
+                "type": "Feature",
+                "properties": {"name": "a"},
+                "geometry": {"type": "Point", "coordinates": [1.0, 1.0]}
+            })),
+            expire_seconds: Some(60),
+            fields: vec![number("speed", 5.0)],
+            ..set_point("g", 0.0, 0.0)
+        })
+        .unwrap();
+        db.jset("fleet", "g", "properties.name", "b", false)
+            .unwrap();
+        assert_eq!(db.ttl("fleet", "g").unwrap(), None);
+        assert_eq!(fields_of(&db, "g").len(), 1);
+        let replayed = db_from_records(&persisted_log_records(&db));
+        assert_eq!(replayed.ttl("fleet", "g").unwrap(), None);
+
+        // Logs written before this behaviour (JSET without the Persist
+        // record) keep their TTL on replay.
+        let legacy = db_from_records(&[
+            LogRecord::Command(Command::SetPersisted(PersistedSetRecord {
+                collection: "fleet".to_owned(),
+                id: "g".to_owned(),
+                object: GeoType::GeoJson(serde_json::json!({
+                    "type": "Feature",
+                    "properties": {},
+                    "geometry": {"type": "Point", "coordinates": [1.0, 1.0]}
+                })),
+                fields: Vec::new(),
+                expires_at_ms: Some(now_millis() + 60_000),
+            })),
+            LogRecord::Command(Command::Jset {
+                collection: "fleet".to_owned(),
+                id: "g".to_owned(),
+                path: "properties.name".to_owned(),
+                value: "b".to_owned(),
+                raw: false,
+            }),
+        ]);
+        assert!(legacy.ttl("fleet", "g").unwrap().is_some());
     }
 
     #[test]

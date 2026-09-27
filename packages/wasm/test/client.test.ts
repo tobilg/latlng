@@ -52,6 +52,19 @@ describe("LatLngWasmClient", () => {
     await expect(collections).resolves.toEqual(["fleet"]);
   });
 
+  it("routes expireDue with a default batch size", async () => {
+    const worker = new FakeWorker();
+    const client = new LatLngWasmClient(worker as unknown as Worker);
+
+    const expired = client.expireDue();
+    const request = worker.requests[1]!;
+    expect(request.method).toBe("expireDue");
+    expect(request.params).toEqual([10_000]);
+    worker.reply(request.id, 2);
+
+    await expect(expired).resolves.toBe(2);
+  });
+
   it("emits typed mutation and geofence events from worker messages", async () => {
     const worker = new FakeWorker();
     const client = new LatLngWasmClient(worker as unknown as Worker);

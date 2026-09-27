@@ -24,6 +24,13 @@ pub struct RequestMetrics {
     hook_delivery_duration_ms: LatencyHistogram,
 }
 
+/// Counters owned by the engine rather than the HTTP layer.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EngineMetrics {
+    pub geofence_eval_errors_total: u64,
+    pub expired_objects_total: u64,
+}
+
 const LATENCY_BUCKETS_MS: [u64; 12] =
     [1, 5, 10, 25, 50, 100, 250, 500, 1_000, 2_500, 5_000, 10_000];
 
@@ -92,6 +99,15 @@ impl RequestMetrics {
         &self,
         replication: Option<&ReplicationStatus>,
         local_last_sequence: Option<u64>,
+    ) -> String {
+        self.prometheus_text_with_engine(replication, local_last_sequence, None)
+    }
+
+    pub fn prometheus_text_with_engine(
+        &self,
+        replication: Option<&ReplicationStatus>,
+        local_last_sequence: Option<u64>,
+        engine: Option<EngineMetrics>,
     ) -> String {
         let counters = [
             (
@@ -196,6 +212,22 @@ impl RequestMetrics {
             "Webhook delivery attempt duration in milliseconds.",
             &self.hook_delivery_duration_ms,
         );
+        if let Some(engine) = engine {
+            push_metric(
+                &mut output,
+                "latlng_geofence_eval_errors_total",
+                "Geofence evaluations that failed and were skipped without failing the write.",
+                "counter",
+                Some(engine.geofence_eval_errors_total),
+            );
+            push_metric(
+                &mut output,
+                "latlng_expired_objects_total",
+                "Objects deleted by the background expiry sweep.",
+                "counter",
+                Some(engine.expired_objects_total),
+            );
+        }
         if let Some(replication) = replication {
             let role = if replication.is_follower() { 1 } else { 0 };
             let local = local_last_sequence.unwrap_or(replication.local_last_sequence);

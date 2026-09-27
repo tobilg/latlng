@@ -1,5 +1,6 @@
 #![forbid(unsafe_code)]
 
+mod cli;
 mod logging;
 mod replication;
 mod storage;
@@ -10,6 +11,8 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
+use clap::Parser;
+use cli::Cli;
 use latlng_capnp::{CapnpAuthConfig, CapnpService};
 use latlng_config::{
     FlushDbCoordinator, FlushDbFuture, LogDestination, LogFormat, RuntimeConfig,
@@ -35,27 +38,24 @@ use uuid::Uuid;
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    if env::args().any(|arg| arg == "--version" || arg == "-V") {
-        println!("latlng-server {}", env!("CARGO_PKG_VERSION"));
-        return Ok(());
-    }
-    if env::args().any(|arg| arg == "--print-config-reference") {
+    let cli = Cli::parse();
+    if cli.print_config_reference {
         println!(
             "{}",
             serde_json::to_string_pretty(&config_reference_json())?
         );
         return Ok(());
     }
-    if env::args().any(|arg| arg == "--print-openapi") {
+    if cli.print_openapi {
         println!(
             "{}",
             serde_json::to_string_pretty(&latlng_http::openapi_spec())?
         );
         return Ok(());
     }
-    let config = read_config()?;
+    let config = read_config(&cli, |name| env::var(name).ok())?;
     config.validate_for_startup()?;
-    if env::args().any(|arg| arg == "--check-config") {
+    if cli.check_config {
         print_config_check(&config)?;
         return Ok(());
     }
@@ -91,12 +91,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     let webhook_queue_path = resolve_webhook_queue_path(&config);
     if matches!(config.storage, RuntimeStorageMode::Memory) {
+        let queue = webhook_queue_path
+            .as_ref()
+            .map_or_else(|| "in-memory".to_owned(), |path| path.display().to_string());
         warn!(
-            queue = %webhook_queue_path.display(),
+            %queue,
             "memory storage mode is active; durable webhook recovery across restarts is not guaranteed"
         );
     }
-    let webhook_queue = Arc::new(WebhookQueue::open(&webhook_queue_path)?);
+    let webhook_queue = Arc::new(match &webhook_queue_path {
+        Some(path) => WebhookQueue::open(path)?,
+        None => WebhookQueue::open_in_memory()?,
+    });
     let starts_following = config
         .follow_host
         .as_ref()
@@ -161,6 +167,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             )
                 .map_err(|error| -> Box<dyn std::error::Error> { error.into() })?;
 
+            let expiry_task = (config.expiry_sweep_interval_ms > 0).then(|| {
+                tokio::task::spawn_local(run_expiry_sweep(
+                    executor.clone(),
+                    Duration::from_millis(config.expiry_sweep_interval_ms),
+                    Arc::clone(&replication_status),
+                    outbox_control.notifier(),
+                    Arc::clone(&replication_notify),
+                ))
+            });
             let hook_task = tokio::spawn(run_webhook_outbox(
                 Arc::clone(&shared),
                 Arc::clone(&webhook_queue),
@@ -204,6 +219,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 capnp_task.abort();
                 let _ = capnp_task.await;
             }
+            if let Some(expiry_task) = expiry_task {
+                expiry_task.abort();
+                let _ = expiry_task.await;
+            }
             hook_task.abort();
             let _ = hook_task.await;
             Ok::<(), Box<dyn std::error::Error>>(())
@@ -212,6 +231,63 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     shared_for_close.close_storage()?;
     Ok(())
+}
+
+/// Upper bound on objects deleted per sweep, so one sweep cannot hold the
+/// write gate for long; remaining objects are picked up on the next tick.
+const EXPIRY_SWEEP_BATCH: usize = 10_000;
+
+/// Deletes expired objects on the leader. Each expiry goes
+/// through the normal delete path, so it is logged, replicated to followers,
+/// and emits geofence `Del` events. Followers skip the sweep and apply the
+/// replicated deletes instead.
+async fn run_expiry_sweep(
+    executor: NativeExecutor<ServerStorage>,
+    interval: Duration,
+    replication_status: SharedReplicationStatus,
+    outbox_notify: Arc<Notify>,
+    replication_notify: Arc<Notify>,
+) {
+    let mut ticker = tokio::time::interval(interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        ticker.tick().await;
+        let following = replication_status
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_follower();
+        if following {
+            continue;
+        }
+        let result = executor
+            .execute(|db: &LatLngNative<ServerStorage>| {
+                let now = unix_millis();
+                // Cheap read-gated check first, so an idle sweep never takes
+                // the exclusive write gate.
+                if db.next_expiry_ms().is_none_or(|next| next > now) {
+                    return Ok(0);
+                }
+                db.expire_due(now, EXPIRY_SWEEP_BATCH)
+            })
+            .await;
+        match result {
+            Ok(Ok(0)) => {}
+            Ok(Ok(expired)) => {
+                tracing::debug!(expired, "expired objects");
+                outbox_notify.notify_waiters();
+                replication_notify.notify_waiters();
+            }
+            Ok(Err(error)) => warn!(%error, "expiry sweep failed"),
+            Err(error) => warn!(%error, "expiry sweep could not be scheduled"),
+        }
+    }
+}
+
+fn unix_millis() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|elapsed| elapsed.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 async fn run_webhook_outbox(
@@ -432,11 +508,16 @@ async fn shutdown_signal() {
     }
 }
 
-fn read_config() -> Result<RuntimeConfig, Box<dyn std::error::Error>> {
-    let args = env::args().skip(1).collect::<Vec<_>>();
-    let config_path = cli_value(&args, "--config")
-        .map(std::path::PathBuf::from)
-        .or_else(|| env::var("LATLNG_CONFIG").ok().map(std::path::PathBuf::from));
+/// Resolves the runtime configuration with precedence
+/// defaults < config file < environment variables < CLI flags.
+fn read_config(
+    cli: &Cli,
+    env: impl Fn(&str) -> Option<String>,
+) -> Result<RuntimeConfig, Box<dyn std::error::Error>> {
+    let config_path = cli
+        .config
+        .clone()
+        .or_else(|| env("LATLNG_CONFIG").map(std::path::PathBuf::from));
     let mut config = if let Some(path) = &config_path {
         load_from_path(path)?
     } else {
@@ -444,394 +525,384 @@ fn read_config() -> Result<RuntimeConfig, Box<dyn std::error::Error>> {
     };
     config.assign_path(config_path);
 
-    if let Ok(value) = env::var("LATLNG_LISTEN") {
+    if let Some(value) = env("LATLNG_LISTEN") {
         config.listen_addr = value;
     }
-    if let Ok(value) = env::var("LATLNG_CAPNP_ENABLED") {
+    if let Some(value) = env("LATLNG_CAPNP_ENABLED") {
         config.capnp_enabled = parse_bool(&value);
     }
-    if let Ok(value) = env::var("LATLNG_CAPNP_LISTEN") {
+    if let Some(value) = env("LATLNG_CAPNP_LISTEN") {
         config.capnp_listen_addr = value;
     }
-    if let Ok(value) = env::var("LATLNG_SERVER_ID") {
+    if let Some(value) = env("LATLNG_SERVER_ID") {
         config.server_id = value;
     }
-    if let Ok(value) = env::var("LATLNG_AOF_PATH") {
+    if let Some(value) = env("LATLNG_AOF_PATH") {
         config.storage = RuntimeStorageMode::Aof { path: value.into() };
     }
-    if let Ok(value) = env::var("LATLNG_BEARER_TOKEN") {
+    if let Some(value) = env("LATLNG_BEARER_TOKEN") {
         config.auth.bearer_token = Some(value);
     }
-    if let Ok(value) = env::var("LATLNG_DISABLE_BEARER_TOKEN") {
+    if let Some(value) = env("LATLNG_DISABLE_BEARER_TOKEN") {
         config.auth.disable_bearer_token = parse_bool(&value);
     }
-    if let Ok(value) = env::var("LATLNG_JWT_SECRET") {
+    if let Some(value) = env("LATLNG_JWT_SECRET") {
         config.auth.jwt_secret = Some(value);
     }
-    if let Ok(value) = env::var("LATLNG_JWT_PUBLIC_KEY_PEM") {
+    if let Some(value) = env("LATLNG_JWT_PUBLIC_KEY_PEM") {
         config.auth.jwt_public_key_pem = Some(value);
     }
-    if let Ok(value) = env::var("LATLNG_JWT_ISSUER") {
+    if let Some(value) = env("LATLNG_JWT_ISSUER") {
         config.auth.jwt_issuer = Some(value);
     }
-    if let Ok(value) = env::var("LATLNG_JWT_AUDIENCE") {
+    if let Some(value) = env("LATLNG_JWT_AUDIENCE") {
         config.auth.jwt_audience = Some(value);
     }
-    if let Ok(value) = env::var("LATLNG_JWT_ALGORITHM") {
+    if let Some(value) = env("LATLNG_JWT_ALGORITHM") {
         config.auth.jwt_algorithm = Some(value);
     }
-    if let Ok(value) = env::var("LATLNG_JWT_LEEWAY_SECONDS") {
+    if let Some(value) = env("LATLNG_JWT_LEEWAY_SECONDS") {
         config.auth.jwt_leeway_seconds = value.parse().unwrap_or(0);
     }
-    if let Ok(value) = env::var("LATLNG_JWKS_URL") {
+    if let Some(value) = env("LATLNG_JWKS_URL") {
         config.auth.jwks_url = Some(value);
     }
-    if let Ok(value) = env::var("LATLNG_JWKS_PROVIDER_ID") {
+    if let Some(value) = env("LATLNG_JWKS_PROVIDER_ID") {
         config.auth.jwks_provider_id = Some(value);
     }
-    if let Ok(value) = env::var("LATLNG_JWKS_REFRESH_INTERVAL_SECONDS") {
+    if let Some(value) = env("LATLNG_JWKS_REFRESH_INTERVAL_SECONDS") {
         config.auth.jwks_refresh_interval_seconds =
             parse_u64_or(value.as_str(), config.auth.jwks_refresh_interval_seconds);
     }
-    if let Ok(value) = env::var("LATLNG_JWKS_CACHE_TTL_SECONDS") {
+    if let Some(value) = env("LATLNG_JWKS_CACHE_TTL_SECONDS") {
         config.auth.jwks_cache_ttl_seconds =
             parse_u64_or(value.as_str(), config.auth.jwks_cache_ttl_seconds);
     }
-    if let Ok(value) = env::var("LATLNG_JWKS_HTTP_TIMEOUT_MS") {
+    if let Some(value) = env("LATLNG_JWKS_HTTP_TIMEOUT_MS") {
         config.auth.jwks_http_timeout_ms =
             parse_u64_or(value.as_str(), config.auth.jwks_http_timeout_ms);
     }
-    if let Ok(value) = env::var("LATLNG_READ_ONLY") {
+    if let Some(value) = env("LATLNG_READ_ONLY") {
         config.read_only = parse_bool(&value);
     }
-    if let Ok(value) = env::var("LATLNG_SUBSCRIBER_QUEUE_CAPACITY") {
+    if let Some(value) = env("LATLNG_SUBSCRIBER_QUEUE_CAPACITY") {
         config.subscriber_queue_capacity =
             parse_usize_or(value.as_str(), config.subscriber_queue_capacity);
     }
-    if let Ok(value) = env::var("LATLNG_WEBHOOK_QUEUE_PATH") {
+    if let Some(value) = env("LATLNG_WEBHOOK_QUEUE_PATH") {
         config.webhook_queue_path = Some(value.into());
     }
-    if let Ok(value) = env::var("LATLNG_WEBHOOK_TIMEOUT_MS") {
+    if let Some(value) = env("LATLNG_WEBHOOK_TIMEOUT_MS") {
         config.webhook_timeout_ms = parse_u64_or(value.as_str(), config.webhook_timeout_ms);
     }
-    if let Ok(value) = env::var("LATLNG_WEBHOOK_CONCURRENCY_LIMIT") {
+    if let Some(value) = env("LATLNG_WEBHOOK_CONCURRENCY_LIMIT") {
         config.webhook_concurrency_limit =
             parse_usize_or(value.as_str(), config.webhook_concurrency_limit);
     }
-    if let Ok(value) = env::var("LATLNG_WEBHOOK_RETRY_COUNT") {
+    if let Some(value) = env("LATLNG_WEBHOOK_RETRY_COUNT") {
         config.webhook_retry_count = parse_u32_or(value.as_str(), config.webhook_retry_count);
     }
-    if let Ok(value) = env::var("LATLNG_WEBHOOK_RETRY_INITIAL_BACKOFF_MS") {
+    if let Some(value) = env("LATLNG_WEBHOOK_RETRY_INITIAL_BACKOFF_MS") {
         config.webhook_retry_initial_backoff_ms =
             parse_u64_or(value.as_str(), config.webhook_retry_initial_backoff_ms);
     }
-    if let Ok(value) = env::var("LATLNG_WEBHOOK_RETRY_MAX_BACKOFF_MS") {
+    if let Some(value) = env("LATLNG_WEBHOOK_RETRY_MAX_BACKOFF_MS") {
         config.webhook_retry_max_backoff_ms =
             parse_u64_or(value.as_str(), config.webhook_retry_max_backoff_ms);
     }
-    if let Ok(value) = env::var("LATLNG_WEBHOOK_LEASE_MS") {
+    if let Some(value) = env("LATLNG_WEBHOOK_LEASE_MS") {
         config.webhook_lease_ms = parse_u64_or(value.as_str(), config.webhook_lease_ms);
     }
-    if let Ok(value) = env::var("LATLNG_NATIVE_EXECUTOR_THREADS") {
+    if let Some(value) = env("LATLNG_EXPIRY_SWEEP_INTERVAL_MS") {
+        config.expiry_sweep_interval_ms =
+            parse_u64_or(value.as_str(), config.expiry_sweep_interval_ms);
+    }
+    if let Some(value) = env("LATLNG_NATIVE_EXECUTOR_THREADS") {
         config.native_executor_threads =
             parse_usize_or(value.as_str(), config.native_executor_threads);
     }
-    if let Ok(value) = env::var("LATLNG_NATIVE_EXECUTOR_QUEUE_LIMIT") {
+    if let Some(value) = env("LATLNG_NATIVE_EXECUTOR_QUEUE_LIMIT") {
         config.native_executor_queue_limit =
             parse_usize_or(value.as_str(), config.native_executor_queue_limit);
     }
-    if let Ok(value) = env::var("LATLNG_AOF_WRITER_QUEUE_LIMIT") {
+    if let Some(value) = env("LATLNG_AOF_WRITER_QUEUE_LIMIT") {
         config.aof_writer_queue_limit =
             parse_usize_or(value.as_str(), config.aof_writer_queue_limit);
     }
-    if let Ok(value) = env::var("LATLNG_AOF_GROUP_COMMIT_DELAY_MS") {
+    if let Some(value) = env("LATLNG_AOF_GROUP_COMMIT_DELAY_MS") {
         config.aof_group_commit_delay_ms =
             parse_u64_or(value.as_str(), config.aof_group_commit_delay_ms);
     }
-    if let Ok(value) = env::var("LATLNG_AOF_GROUP_COMMIT_MAX_REQUESTS") {
+    if let Some(value) = env("LATLNG_AOF_GROUP_COMMIT_MAX_REQUESTS") {
         config.aof_group_commit_max_requests =
             parse_usize_or(value.as_str(), config.aof_group_commit_max_requests);
     }
-    if let Ok(value) = env::var("LATLNG_FOLLOW_HOST") {
+    if let Some(value) = env("LATLNG_FOLLOW_HOST") {
         config.follow_host = Some(value);
     }
-    if let Ok(value) = env::var("LATLNG_FOLLOW_PORT") {
+    if let Some(value) = env("LATLNG_FOLLOW_PORT") {
         config.follow_port = value.parse::<u16>().ok().filter(|port| *port > 0);
     }
-    if let Ok(value) = env::var("LATLNG_REPLICATION_CREDENTIAL") {
+    if let Some(value) = env("LATLNG_REPLICATION_CREDENTIAL") {
         config.replication_credential = Some(value);
     }
-    if let Ok(value) = env::var("LATLNG_REPLICATION_BATCH_SIZE") {
+    if let Some(value) = env("LATLNG_REPLICATION_BATCH_SIZE") {
         config.replication_batch_size =
             parse_usize_or(value.as_str(), config.replication_batch_size);
     }
-    if let Ok(value) = env::var("LATLNG_REPLICATION_RECONNECT_BACKOFF_MS") {
+    if let Some(value) = env("LATLNG_REPLICATION_RECONNECT_BACKOFF_MS") {
         config.replication_reconnect_backoff_ms =
             parse_u64_or(value.as_str(), config.replication_reconnect_backoff_ms);
     }
-    if let Ok(value) = env::var("LATLNG_HTTP_CORS_ENABLED") {
+    if let Some(value) = env("LATLNG_HTTP_CORS_ENABLED") {
         config.http_cors_enabled = parse_bool(&value);
     }
-    if let Ok(value) = env::var("LATLNG_HTTP_CORS_ALLOWED_ORIGINS") {
+    if let Some(value) = env("LATLNG_HTTP_CORS_ALLOWED_ORIGINS") {
         config.http_cors_allowed_origins = parse_csv(&value);
     }
-    if let Ok(value) = env::var("LATLNG_HTTP_CORS_ALLOWED_METHODS") {
+    if let Some(value) = env("LATLNG_HTTP_CORS_ALLOWED_METHODS") {
         config.http_cors_allowed_methods = parse_csv(&value);
     }
-    if let Ok(value) = env::var("LATLNG_HTTP_CORS_ALLOWED_HEADERS") {
+    if let Some(value) = env("LATLNG_HTTP_CORS_ALLOWED_HEADERS") {
         config.http_cors_allowed_headers = parse_csv(&value);
     }
-    if let Ok(value) = env::var("LATLNG_HTTP_CORS_MAX_AGE_SECONDS") {
+    if let Some(value) = env("LATLNG_HTTP_CORS_MAX_AGE_SECONDS") {
         config.http_cors_max_age_seconds = value.trim().parse::<u64>().ok();
     }
-    if let Ok(value) = env::var("LATLNG_LOGGING_ENABLED") {
+    if let Some(value) = env("LATLNG_LOGGING_ENABLED") {
         config.logging_enabled = parse_bool(&value);
     }
-    if let Ok(value) = env::var("LATLNG_LOG_FORMAT") {
+    if let Some(value) = env("LATLNG_LOG_FORMAT") {
         config.log_format =
             parse_log_format(&value).ok_or_else(|| format!("unsupported log format: {value}"))?;
     }
-    if let Ok(value) = env::var("LATLNG_LOG_LEVEL") {
+    if let Some(value) = env("LATLNG_LOG_LEVEL") {
         config.log_level = value;
     }
-    if let Ok(value) = env::var("LATLNG_LOG_DESTINATION") {
+    if let Some(value) = env("LATLNG_LOG_DESTINATION") {
         config.log_destination = parse_log_destination(&value)
             .ok_or_else(|| format!("unsupported log destination: {value}"))?;
     }
-    if let Ok(value) = env::var("LATLNG_LOG_FILE_PATH") {
+    if let Some(value) = env("LATLNG_LOG_FILE_PATH") {
         config.log_file_path = Some(value.into());
     }
-    if let Ok(value) = env::var("LATLNG_REQUIRE_AUTH") {
+    if let Some(value) = env("LATLNG_REQUIRE_AUTH") {
         config.require_auth = parse_bool(&value);
     }
-    if let Ok(value) = env::var("LATLNG_PRODUCTION_MODE") {
+    if let Some(value) = env("LATLNG_PRODUCTION_MODE") {
         config.production_mode = parse_bool(&value);
     }
-    if let Ok(value) = env::var("LATLNG_HTTP_MAX_BODY_BYTES") {
+    if let Some(value) = env("LATLNG_HTTP_MAX_BODY_BYTES") {
         config.http_max_body_bytes = parse_usize_or(value.as_str(), config.http_max_body_bytes);
     }
-    if let Ok(value) = env::var("LATLNG_HTTP_REQUEST_TIMEOUT_MS") {
+    if let Some(value) = env("LATLNG_HTTP_REQUEST_TIMEOUT_MS") {
         config.http_request_timeout_ms =
             parse_u64_or(value.as_str(), config.http_request_timeout_ms);
     }
-    if let Ok(value) = env::var("LATLNG_HTTP_RATE_LIMIT_ENABLED") {
+    if let Some(value) = env("LATLNG_HTTP_RATE_LIMIT_ENABLED") {
         config.http_rate_limit_enabled = parse_bool(&value);
     }
-    if let Ok(value) = env::var("LATLNG_HTTP_RATE_LIMIT_REQUESTS_PER_SECOND") {
+    if let Some(value) = env("LATLNG_HTTP_RATE_LIMIT_REQUESTS_PER_SECOND") {
         config.http_rate_limit_requests_per_second =
             parse_u64_or(value.as_str(), config.http_rate_limit_requests_per_second);
     }
-    if let Ok(value) = env::var("LATLNG_HTTP_RATE_LIMIT_BURST") {
+    if let Some(value) = env("LATLNG_HTTP_RATE_LIMIT_BURST") {
         config.http_rate_limit_burst = parse_u64_or(value.as_str(), config.http_rate_limit_burst);
     }
-    if let Ok(value) = env::var("LATLNG_HTTP_PRINCIPAL_RATE_LIMIT_ENABLED") {
+    if let Some(value) = env("LATLNG_HTTP_PRINCIPAL_RATE_LIMIT_ENABLED") {
         config.http_principal_rate_limit_enabled = parse_bool(&value);
     }
-    if let Ok(value) = env::var("LATLNG_HTTP_PRINCIPAL_RATE_LIMIT_REQUESTS_PER_SECOND") {
+    if let Some(value) = env("LATLNG_HTTP_PRINCIPAL_RATE_LIMIT_REQUESTS_PER_SECOND") {
         config.http_principal_rate_limit_requests_per_second = parse_u64_or(
             value.as_str(),
             config.http_principal_rate_limit_requests_per_second,
         );
     }
-    if let Ok(value) = env::var("LATLNG_HTTP_PRINCIPAL_RATE_LIMIT_BURST") {
+    if let Some(value) = env("LATLNG_HTTP_PRINCIPAL_RATE_LIMIT_BURST") {
         config.http_principal_rate_limit_burst =
             parse_u64_or(value.as_str(), config.http_principal_rate_limit_burst);
     }
 
-    if let Some(value) = cli_value(&args, "--listen") {
-        config.listen_addr = value.to_owned();
+    apply_cli_overrides(&mut config, cli)?;
+
+    Ok(config)
+}
+
+fn apply_cli_overrides(
+    config: &mut RuntimeConfig,
+    cli: &Cli,
+) -> Result<(), Box<dyn std::error::Error>> {
+    fn set<T: Clone>(target: &mut T, value: &Option<T>) {
+        if let Some(value) = value {
+            *target = value.clone();
+        }
     }
-    if let Some(value) = cli_bool_or_value(&args, "--capnp-enabled") {
-        config.capnp_enabled = value;
+    fn set_some<T: Clone>(target: &mut Option<T>, value: &Option<T>) {
+        if let Some(value) = value {
+            *target = Some(value.clone());
+        }
     }
-    if args.iter().any(|flag| flag == "--no-capnp") {
+
+    set(&mut config.listen_addr, &cli.listen);
+    set(&mut config.capnp_enabled, &cli.capnp_enabled);
+    if cli.no_capnp {
         config.capnp_enabled = false;
     }
-    if let Some(value) = cli_value(&args, "--capnp-listen") {
-        config.capnp_listen_addr = value.to_owned();
+    set(&mut config.capnp_listen_addr, &cli.capnp_listen);
+    set(&mut config.server_id, &cli.server_id);
+    if let Some(path) = &cli.aof {
+        config.storage = RuntimeStorageMode::Aof { path: path.clone() };
     }
-    if let Some(value) = cli_value(&args, "--server-id") {
-        config.server_id = value.to_owned();
-    }
-    if let Some(value) = cli_value(&args, "--aof") {
-        config.storage = RuntimeStorageMode::Aof { path: value.into() };
-    }
-    if args.iter().any(|flag| flag == "--memory") {
+    if cli.memory {
         config.storage = RuntimeStorageMode::Memory;
     }
-    if let Some(value) = cli_value(&args, "--bearer-token") {
-        config.auth.bearer_token = Some(value.to_owned());
-    }
-    if args.iter().any(|flag| flag == "--disable-bearer-token") {
+    set_some(&mut config.auth.bearer_token, &cli.bearer_token);
+    if cli.disable_bearer_token {
         config.auth.disable_bearer_token = true;
     }
-    if let Some(value) = cli_value(&args, "--jwt-secret") {
-        config.auth.jwt_secret = Some(value.to_owned());
+    set_some(&mut config.auth.jwt_secret, &cli.jwt_secret);
+    set_some(&mut config.auth.jwt_public_key_pem, &cli.jwt_public_key_pem);
+    set_some(&mut config.auth.jwt_issuer, &cli.jwt_issuer);
+    set_some(&mut config.auth.jwt_audience, &cli.jwt_audience);
+    set_some(&mut config.auth.jwt_algorithm, &cli.jwt_algorithm);
+    set(&mut config.auth.jwt_leeway_seconds, &cli.jwt_leeway);
+    set_some(&mut config.auth.jwks_url, &cli.jwks_url);
+    set_some(&mut config.auth.jwks_provider_id, &cli.jwks_provider_id);
+    set(
+        &mut config.auth.jwks_refresh_interval_seconds,
+        &cli.jwks_refresh_interval_seconds,
+    );
+    set(
+        &mut config.auth.jwks_cache_ttl_seconds,
+        &cli.jwks_cache_ttl_seconds,
+    );
+    set(
+        &mut config.auth.jwks_http_timeout_ms,
+        &cli.jwks_http_timeout_ms,
+    );
+    set(&mut config.read_only, &cli.read_only);
+    set(
+        &mut config.subscriber_queue_capacity,
+        &cli.subscriber_queue_capacity,
+    );
+    set_some(&mut config.webhook_queue_path, &cli.webhook_queue_path);
+    set(&mut config.webhook_timeout_ms, &cli.webhook_timeout_ms);
+    set(
+        &mut config.webhook_concurrency_limit,
+        &cli.webhook_concurrency_limit,
+    );
+    set(&mut config.webhook_retry_count, &cli.webhook_retry_count);
+    set(
+        &mut config.webhook_retry_initial_backoff_ms,
+        &cli.webhook_retry_initial_backoff_ms,
+    );
+    set(
+        &mut config.webhook_retry_max_backoff_ms,
+        &cli.webhook_retry_max_backoff_ms,
+    );
+    set(&mut config.webhook_lease_ms, &cli.webhook_lease_ms);
+    set(
+        &mut config.expiry_sweep_interval_ms,
+        &cli.expiry_sweep_interval_ms,
+    );
+    set(
+        &mut config.native_executor_threads,
+        &cli.native_executor_threads,
+    );
+    set(
+        &mut config.native_executor_queue_limit,
+        &cli.native_executor_queue_limit,
+    );
+    set(
+        &mut config.aof_writer_queue_limit,
+        &cli.aof_writer_queue_limit,
+    );
+    set(
+        &mut config.aof_group_commit_delay_ms,
+        &cli.aof_group_commit_delay_ms,
+    );
+    set(
+        &mut config.aof_group_commit_max_requests,
+        &cli.aof_group_commit_max_requests,
+    );
+    set_some(&mut config.follow_host, &cli.follow_host);
+    if let Some(port) = cli.follow_port {
+        config.follow_port = Some(port).filter(|port| *port > 0);
     }
-    if let Some(value) = cli_value(&args, "--jwt-public-key-pem") {
-        config.auth.jwt_public_key_pem = Some(value.to_owned());
-    }
-    if let Some(value) = cli_value(&args, "--jwt-issuer") {
-        config.auth.jwt_issuer = Some(value.to_owned());
-    }
-    if let Some(value) = cli_value(&args, "--jwt-audience") {
-        config.auth.jwt_audience = Some(value.to_owned());
-    }
-    if let Some(value) = cli_value(&args, "--jwt-algorithm") {
-        config.auth.jwt_algorithm = Some(value.to_owned());
-    }
-    if let Some(value) = cli_value(&args, "--jwt-leeway") {
-        config.auth.jwt_leeway_seconds = value.parse().unwrap_or(0);
-    }
-    if let Some(value) = cli_value(&args, "--jwks-url") {
-        config.auth.jwks_url = Some(value.to_owned());
-    }
-    if let Some(value) = cli_value(&args, "--jwks-provider-id") {
-        config.auth.jwks_provider_id = Some(value.to_owned());
-    }
-    if let Some(value) = cli_value(&args, "--jwks-refresh-interval-seconds") {
-        config.auth.jwks_refresh_interval_seconds =
-            parse_u64_or(value, config.auth.jwks_refresh_interval_seconds);
-    }
-    if let Some(value) = cli_value(&args, "--jwks-cache-ttl-seconds") {
-        config.auth.jwks_cache_ttl_seconds =
-            parse_u64_or(value, config.auth.jwks_cache_ttl_seconds);
-    }
-    if let Some(value) = cli_value(&args, "--jwks-http-timeout-ms") {
-        config.auth.jwks_http_timeout_ms = parse_u64_or(value, config.auth.jwks_http_timeout_ms);
-    }
-    if let Some(value) = cli_value(&args, "--read-only") {
-        config.read_only = parse_bool(value);
-    }
-    if let Some(value) = cli_value(&args, "--subscriber-queue-capacity") {
-        config.subscriber_queue_capacity = parse_usize_or(value, config.subscriber_queue_capacity);
-    }
-    if let Some(value) = cli_value(&args, "--webhook-queue-path") {
-        config.webhook_queue_path = Some(value.into());
-    }
-    if let Some(value) = cli_value(&args, "--webhook-timeout-ms") {
-        config.webhook_timeout_ms = parse_u64_or(value, config.webhook_timeout_ms);
-    }
-    if let Some(value) = cli_value(&args, "--webhook-concurrency-limit") {
-        config.webhook_concurrency_limit = parse_usize_or(value, config.webhook_concurrency_limit);
-    }
-    if let Some(value) = cli_value(&args, "--webhook-retry-count") {
-        config.webhook_retry_count = parse_u32_or(value, config.webhook_retry_count);
-    }
-    if let Some(value) = cli_value(&args, "--webhook-retry-initial-backoff-ms") {
-        config.webhook_retry_initial_backoff_ms =
-            parse_u64_or(value, config.webhook_retry_initial_backoff_ms);
-    }
-    if let Some(value) = cli_value(&args, "--webhook-retry-max-backoff-ms") {
-        config.webhook_retry_max_backoff_ms =
-            parse_u64_or(value, config.webhook_retry_max_backoff_ms);
-    }
-    if let Some(value) = cli_value(&args, "--webhook-lease-ms") {
-        config.webhook_lease_ms = parse_u64_or(value, config.webhook_lease_ms);
-    }
-    if let Some(value) = cli_value(&args, "--native-executor-threads") {
-        config.native_executor_threads = parse_usize_or(value, config.native_executor_threads);
-    }
-    if let Some(value) = cli_value(&args, "--native-executor-queue-limit") {
-        config.native_executor_queue_limit =
-            parse_usize_or(value, config.native_executor_queue_limit);
-    }
-    if let Some(value) = cli_value(&args, "--aof-writer-queue-limit") {
-        config.aof_writer_queue_limit = parse_usize_or(value, config.aof_writer_queue_limit);
-    }
-    if let Some(value) = cli_value(&args, "--aof-group-commit-delay-ms") {
-        config.aof_group_commit_delay_ms = parse_u64_or(value, config.aof_group_commit_delay_ms);
-    }
-    if let Some(value) = cli_value(&args, "--aof-group-commit-max-requests") {
-        config.aof_group_commit_max_requests =
-            parse_usize_or(value, config.aof_group_commit_max_requests);
-    }
-    if let Some(value) = cli_value(&args, "--follow-host") {
-        config.follow_host = Some(value.to_owned());
-    }
-    if let Some(value) = cli_value(&args, "--follow-port") {
-        config.follow_port = value.parse::<u16>().ok().filter(|port| *port > 0);
-    }
-    if let Some(value) = cli_value(&args, "--replication-credential") {
-        config.replication_credential = Some(value.to_owned());
-    }
-    if let Some(value) = cli_value(&args, "--replication-batch-size") {
-        config.replication_batch_size = parse_usize_or(value, config.replication_batch_size);
-    }
-    if let Some(value) = cli_value(&args, "--replication-reconnect-backoff-ms") {
-        config.replication_reconnect_backoff_ms =
-            parse_u64_or(value, config.replication_reconnect_backoff_ms);
-    }
-    if let Some(value) = cli_bool_or_value(&args, "--http-cors-enabled") {
-        config.http_cors_enabled = value;
-    }
-    if let Some(value) = cli_value(&args, "--http-cors-allowed-origins") {
+    set_some(
+        &mut config.replication_credential,
+        &cli.replication_credential,
+    );
+    set(
+        &mut config.replication_batch_size,
+        &cli.replication_batch_size,
+    );
+    set(
+        &mut config.replication_reconnect_backoff_ms,
+        &cli.replication_reconnect_backoff_ms,
+    );
+    set(&mut config.http_cors_enabled, &cli.http_cors_enabled);
+    if let Some(value) = &cli.http_cors_allowed_origins {
         config.http_cors_allowed_origins = parse_csv(value);
     }
-    if let Some(value) = cli_value(&args, "--http-cors-allowed-methods") {
+    if let Some(value) = &cli.http_cors_allowed_methods {
         config.http_cors_allowed_methods = parse_csv(value);
     }
-    if let Some(value) = cli_value(&args, "--http-cors-allowed-headers") {
+    if let Some(value) = &cli.http_cors_allowed_headers {
         config.http_cors_allowed_headers = parse_csv(value);
     }
-    if let Some(value) = cli_value(&args, "--http-cors-max-age-seconds") {
-        config.http_cors_max_age_seconds = value.trim().parse::<u64>().ok();
-    }
-    if let Some(value) = cli_bool_or_value(&args, "--logging-enabled") {
-        config.logging_enabled = value;
-    }
-    if args.iter().any(|flag| flag == "--no-logging") {
+    set_some(
+        &mut config.http_cors_max_age_seconds,
+        &cli.http_cors_max_age_seconds,
+    );
+    set(&mut config.logging_enabled, &cli.logging_enabled);
+    if cli.no_logging {
         config.logging_enabled = false;
     }
-    if let Some(value) = cli_value(&args, "--log-format") {
+    if let Some(value) = &cli.log_format {
         config.log_format =
             parse_log_format(value).ok_or_else(|| format!("unsupported log format: {value}"))?;
     }
-    if let Some(value) = cli_value(&args, "--log-level") {
-        config.log_level = value.to_owned();
-    }
-    if let Some(value) = cli_value(&args, "--log-destination") {
+    set(&mut config.log_level, &cli.log_level);
+    if let Some(value) = &cli.log_destination {
         config.log_destination = parse_log_destination(value)
             .ok_or_else(|| format!("unsupported log destination: {value}"))?;
     }
-    if let Some(value) = cli_value(&args, "--log-file") {
-        config.log_file_path = Some(value.into());
-    }
-    if args.iter().any(|flag| flag == "--require-auth") {
+    set_some(&mut config.log_file_path, &cli.log_file);
+    if cli.require_auth {
         config.require_auth = true;
     }
-    if let Some(value) = cli_bool_or_value(&args, "--production-mode") {
-        config.production_mode = value;
-    }
-    if let Some(value) = cli_value(&args, "--http-max-body-bytes") {
-        config.http_max_body_bytes = parse_usize_or(value, config.http_max_body_bytes);
-    }
-    if let Some(value) = cli_value(&args, "--http-request-timeout-ms") {
-        config.http_request_timeout_ms = parse_u64_or(value, config.http_request_timeout_ms);
-    }
-    if let Some(value) = cli_bool_or_value(&args, "--http-rate-limit-enabled") {
-        config.http_rate_limit_enabled = value;
-    }
-    if let Some(value) = cli_value(&args, "--http-rate-limit-requests-per-second") {
-        config.http_rate_limit_requests_per_second =
-            parse_u64_or(value, config.http_rate_limit_requests_per_second);
-    }
-    if let Some(value) = cli_value(&args, "--http-rate-limit-burst") {
-        config.http_rate_limit_burst = parse_u64_or(value, config.http_rate_limit_burst);
-    }
-    if let Some(value) = cli_bool_or_value(&args, "--http-principal-rate-limit-enabled") {
-        config.http_principal_rate_limit_enabled = value;
-    }
-    if let Some(value) = cli_value(&args, "--http-principal-rate-limit-requests-per-second") {
-        config.http_principal_rate_limit_requests_per_second =
-            parse_u64_or(value, config.http_principal_rate_limit_requests_per_second);
-    }
-    if let Some(value) = cli_value(&args, "--http-principal-rate-limit-burst") {
-        config.http_principal_rate_limit_burst =
-            parse_u64_or(value, config.http_principal_rate_limit_burst);
-    }
-
-    Ok(config)
+    set(&mut config.production_mode, &cli.production_mode);
+    set(&mut config.http_max_body_bytes, &cli.http_max_body_bytes);
+    set(
+        &mut config.http_request_timeout_ms,
+        &cli.http_request_timeout_ms,
+    );
+    set(
+        &mut config.http_rate_limit_enabled,
+        &cli.http_rate_limit_enabled,
+    );
+    set(
+        &mut config.http_rate_limit_requests_per_second,
+        &cli.http_rate_limit_requests_per_second,
+    );
+    set(
+        &mut config.http_rate_limit_burst,
+        &cli.http_rate_limit_burst,
+    );
+    set(
+        &mut config.http_principal_rate_limit_enabled,
+        &cli.http_principal_rate_limit_enabled,
+    );
+    set(
+        &mut config.http_principal_rate_limit_requests_per_second,
+        &cli.http_principal_rate_limit_requests_per_second,
+    );
+    set(
+        &mut config.http_principal_rate_limit_burst,
+        &cli.http_principal_rate_limit_burst,
+    );
+    Ok(())
 }
 
 fn print_config_check(config: &RuntimeConfig) -> Result<(), Box<dyn std::error::Error>> {
@@ -875,20 +946,6 @@ fn print_config_check(config: &RuntimeConfig) -> Result<(), Box<dyn std::error::
     });
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
-}
-
-fn cli_value<'a>(args: &'a [String], flag: &str) -> Option<&'a str> {
-    args.windows(2)
-        .find(|window| window[0] == flag)
-        .map(|window| window[1].as_str())
-}
-
-fn cli_bool_or_value(args: &[String], flag: &str) -> Option<bool> {
-    let index = args.iter().position(|value| value == flag)?;
-    match args.get(index + 1) {
-        Some(value) if !value.starts_with("--") => Some(parse_bool(value)),
-        _ => Some(true),
-    }
 }
 
 fn parse_bool(value: &str) -> bool {
@@ -993,13 +1050,16 @@ fn webhook_lease_ms(runtime_config: &SharedRuntimeConfig) -> u64 {
     }
 }
 
-fn resolve_webhook_queue_path(config: &RuntimeConfig) -> PathBuf {
+/// Returns where the webhook queue lives, or `None` for an in-memory queue.
+/// Memory storage makes no durability promise, so without an explicit path it
+/// keeps the queue in memory instead of writing into the working directory.
+fn resolve_webhook_queue_path(config: &RuntimeConfig) -> Option<PathBuf> {
     if let Some(path) = &config.webhook_queue_path {
-        return path.clone();
+        return Some(path.clone());
     }
     match &config.storage {
-        RuntimeStorageMode::Aof { path } => path.with_extension("webhooks.sqlite"),
-        RuntimeStorageMode::Memory => PathBuf::from("./data/webhook-queue.sqlite"),
+        RuntimeStorageMode::Aof { path } => Some(path.with_extension("webhooks.sqlite")),
+        RuntimeStorageMode::Memory => None,
     }
 }
 
@@ -1252,4 +1312,59 @@ struct WebhookAttemptResult {
 enum WebhookDeliveryOutcome {
     Attempted(Result<(), latlng_endpoints::EndpointError>),
     Skipped,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use clap::Parser;
+
+    use super::{Cli, read_config};
+
+    fn resolve(args: &[&str], env: &[(&str, &str)]) -> latlng_config::RuntimeConfig {
+        let cli = Cli::try_parse_from(std::iter::once("latlng-server").chain(args.iter().copied()))
+            .unwrap();
+        let env = env
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), (*value).to_owned()))
+            .collect::<HashMap<_, _>>();
+        read_config(&cli, |name| env.get(name).cloned()).unwrap()
+    }
+
+    #[test]
+    fn precedence_is_file_then_env_then_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("latlng.json");
+        std::fs::write(
+            &config_path,
+            r#"{"listen_addr": "127.0.0.1:1001", "capnp_enabled": false}"#,
+        )
+        .unwrap();
+        let config_arg = config_path.to_str().unwrap();
+
+        let from_file = resolve(&["--config", config_arg], &[]);
+        assert_eq!(from_file.listen_addr, "127.0.0.1:1001");
+
+        let from_env = resolve(
+            &["--config", config_arg],
+            &[("LATLNG_LISTEN", "127.0.0.1:1002")],
+        );
+        assert_eq!(from_env.listen_addr, "127.0.0.1:1002");
+
+        let from_cli = resolve(
+            &["--config", config_arg, "--listen=127.0.0.1:1003"],
+            &[("LATLNG_LISTEN", "127.0.0.1:1002")],
+        );
+        assert_eq!(from_cli.listen_addr, "127.0.0.1:1003");
+
+        let config_from_env = resolve(&[], &[("LATLNG_CONFIG", config_arg)]);
+        assert_eq!(config_from_env.listen_addr, "127.0.0.1:1001");
+    }
+
+    #[test]
+    fn capnp_enabled_equals_form_enables_capnp() {
+        assert!(resolve(&["--capnp-enabled=true"], &[]).capnp_enabled);
+        assert!(!resolve(&["--capnp-enabled", "--no-capnp"], &[]).capnp_enabled);
+    }
 }

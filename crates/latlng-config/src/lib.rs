@@ -73,6 +73,8 @@ pub struct RuntimeConfig {
     pub webhook_retry_max_backoff_ms: u64,
     #[serde(default = "default_webhook_lease_ms")]
     pub webhook_lease_ms: u64,
+    #[serde(default = "default_expiry_sweep_interval_ms")]
+    pub expiry_sweep_interval_ms: u64,
     #[serde(default = "default_native_executor_threads")]
     pub native_executor_threads: usize,
     #[serde(default = "default_native_executor_queue_limit")]
@@ -213,7 +215,7 @@ pub fn config_reference() -> Vec<ConfigReferenceEntry> {
             "webhook_queue_path",
             "path|null",
             serde_json::Value::Null,
-            "SQLite webhook queue path. Defaults near the AOF or current directory.",
+            "SQLite webhook queue path. Defaults to the AOF path with a `.webhooks.sqlite` extension (for example `appendonly.webhooks.sqlite`); in memory storage mode the queue is kept in memory unless a path is set.",
         ),
         config_entry(
             "webhook_timeout_ms",
@@ -250,6 +252,12 @@ pub fn config_reference() -> Vec<ConfigReferenceEntry> {
             "u64",
             default_webhook_lease_ms(),
             "Webhook job lease duration.",
+        ),
+        config_entry(
+            "expiry_sweep_interval_ms",
+            "u64",
+            default_expiry_sweep_interval_ms(),
+            "How often the leader deletes objects whose TTL has passed. 0 disables the sweep.",
         ),
         config_entry(
             "native_executor_threads",
@@ -538,6 +546,7 @@ impl Default for RuntimeConfig {
             webhook_retry_initial_backoff_ms: default_webhook_retry_initial_backoff_ms(),
             webhook_retry_max_backoff_ms: default_webhook_retry_max_backoff_ms(),
             webhook_lease_ms: default_webhook_lease_ms(),
+            expiry_sweep_interval_ms: default_expiry_sweep_interval_ms(),
             native_executor_threads: default_native_executor_threads(),
             native_executor_queue_limit: default_native_executor_queue_limit(),
             aof_writer_queue_limit: default_aof_writer_queue_limit(),
@@ -874,6 +883,10 @@ pub fn default_webhook_lease_ms() -> u64 {
     30_000
 }
 
+pub fn default_expiry_sweep_interval_ms() -> u64 {
+    100
+}
+
 pub fn default_native_executor_threads() -> usize {
     std::thread::available_parallelism()
         .map(|value| value.get())
@@ -1017,6 +1030,7 @@ mod tests {
             webhook_retry_initial_backoff_ms: 250,
             webhook_retry_max_backoff_ms: 5_000,
             webhook_lease_ms: 45_000,
+            expiry_sweep_interval_ms: 250,
             native_executor_threads: 6,
             native_executor_queue_limit: 96,
             aof_writer_queue_limit: 512,

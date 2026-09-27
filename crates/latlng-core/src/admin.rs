@@ -16,6 +16,85 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
         gc_collections_locked::<P>(&self.collections);
     }
 
+    /// Deletes up to `max` objects whose TTL has passed at `now_ms` through the
+    /// normal delete path, so each expiry is logged, replicated, and emits
+    /// geofence `Del` events. Returns how many objects were deleted.
+    ///
+    /// Only the leader should call this; followers receive the deletes through
+    /// replication. Does nothing in read-only mode.
+    pub fn expire_due(&self, now_ms: u64, max: usize) -> Result<usize> {
+        let _gate = self.write_control();
+        if P::read(&self.config).read_only {
+            return Ok(0);
+        }
+        let handles = {
+            let collections = P::read(&self.collections);
+            collections
+                .iter()
+                .map(|(name, handle)| (name.clone(), handle.clone()))
+                .collect::<Vec<_>>()
+        };
+        let mut expired = 0;
+        for (name, handle) in handles {
+            if expired >= max {
+                break;
+            }
+            let due = P::read(&*handle)
+                .collection
+                .due_expirations(now_ms, max - expired);
+            // The exclusive gate blocks concurrent writes, so every due id is
+            // still expired when it is deleted.
+            for id in due {
+                if self.del_exclusive(&name, &id)? {
+                    expired += 1;
+                }
+            }
+        }
+        self.expired_objects_total
+            .fetch_add(expired as u64, std::sync::atomic::Ordering::Relaxed);
+        Ok(expired)
+    }
+
+    /// Total objects deleted by [`LatLng::expire_due`] since start-up.
+    pub fn expired_objects_total(&self) -> u64 {
+        self.expired_objects_total
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Lists up to `max` `(collection, id)` pairs whose TTL has passed at
+    /// `now_ms`, without deleting them.
+    pub fn due_expirations(&self, now_ms: u64, max: usize) -> Vec<(String, String)> {
+        let _gate = self.read_control();
+        let collections = P::read(&self.collections);
+        let mut due = Vec::new();
+        for (name, handle) in collections.iter() {
+            if due.len() >= max {
+                break;
+            }
+            let ids = P::read(&**handle)
+                .collection
+                .due_expirations(now_ms, max - due.len());
+            due.extend(ids.into_iter().map(|id| (name.clone(), id)));
+        }
+        due
+    }
+
+    /// Earliest pending TTL deadline across all collections, if any.
+    pub fn next_expiry_ms(&self) -> Option<u64> {
+        let _gate = self.read_control();
+        let collections = P::read(&self.collections);
+        collections
+            .values()
+            .filter_map(|handle| {
+                P::read(&**handle)
+                    .collection
+                    .expirations
+                    .first()
+                    .map(|(deadline, _)| *deadline)
+            })
+            .min()
+    }
+
     pub fn server_info(&self) -> ServerInfo {
         let _gate = self.read_control();
         let collections = P::read(&self.collections);

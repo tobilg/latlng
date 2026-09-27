@@ -133,6 +133,12 @@ async function dispatch(
       emitMutation({ type: "object:persist", collection, id, changed: response.result });
       return response.result;
     }
+    case "expireDue": {
+      const [max] = expectParams<[number]>(params);
+      const response = db.expire_due(max) as WasmMutationResponse<number>;
+      emitGeofences(response.events);
+      return response.result;
+    }
     case "ttl": {
       const [collection, id] = expectParams<[string, string]>(params);
       return db.ttl(collection, id);

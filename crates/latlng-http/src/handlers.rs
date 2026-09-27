@@ -1,13 +1,14 @@
 use axum::Extension;
-use axum::Json;
-use axum::extract::{Path, Query, State};
+use axum::extract::State;
 use axum::http::{HeaderMap, header};
 use axum::response::{IntoResponse, Response};
 use latlng_auth::{AuthAction, AuthPrincipal};
 use latlng_config::{RuntimeConfig, SharedRuntimeConfig, save_to_path};
 use latlng_core::index::{OutputFormat, SearchOptions};
 use latlng_core::storage::StorageBackend;
-use latlng_core::{FieldEntry, GetOptions, LatLngNative, NearbyQuery, SetCondition, SetRequest};
+use latlng_core::{
+    ErrorKind, FieldEntry, GetOptions, LatLngNative, NearbyQuery, SetCondition, SetRequest,
+};
 use latlng_geofence::GeofenceDef;
 use latlng_native_executor::NativeExecutor;
 use latlng_replication::ReplicationStatus;
@@ -18,6 +19,8 @@ use crate::authz::{
     authenticate_headers, cached_auth_principal, ensure_admin, ensure_collection_action,
     ensure_global_action,
 };
+use crate::error::{Json, Path, Query};
+use crate::metrics::EngineMetrics;
 use crate::{HttpError, HttpState, openapi_spec};
 
 pub(crate) async fn ping<S>(
@@ -68,12 +71,12 @@ where
         .map_err(core_error_to_http)
 }
 
-fn core_error_to_http(error: latlng_core::CoreError) -> HttpError {
-    match error {
-        latlng_core::CoreError::ReadOnly => {
-            HttpError::BadRequest("read-only mode is enabled".to_owned())
-        }
-        other => internal(other),
+pub(crate) fn core_error_to_http(error: latlng_core::CoreError) -> HttpError {
+    match error.kind() {
+        ErrorKind::NotFound => HttpError::NotFound(error.to_string()),
+        // Read-only keeps its historical 400 status.
+        ErrorKind::BadRequest | ErrorKind::ReadOnly => HttpError::BadRequest(error.to_string()),
+        ErrorKind::Internal => internal(error),
     }
 }
 
@@ -146,17 +149,30 @@ where
     .await?;
     ensure_global_action(&principal, AuthAction::MetricsRead)?;
     let replication = replication_snapshot(&state);
-    let local_last_sequence = run_db(&state.executor, move |db| Ok(db.last_sequence()))
-        .await
-        .ok();
+    let (local_last_sequence, engine) = match run_db(&state.executor, move |db| {
+        Ok((
+            db.last_sequence(),
+            EngineMetrics {
+                geofence_eval_errors_total: db.geofence_eval_errors_total(),
+                expired_objects_total: db.expired_objects_total(),
+            },
+        ))
+    })
+    .await
+    {
+        Ok((sequence, engine)) => (Some(sequence), Some(engine)),
+        Err(_) => (None, None),
+    };
     Ok((
         [(
             header::CONTENT_TYPE,
             "text/plain; version=0.0.4; charset=utf-8",
         )],
-        state
-            .metrics
-            .prometheus_text_with_replication(replication.as_ref(), local_last_sequence),
+        state.metrics.prometheus_text_with_engine(
+            replication.as_ref(),
+            local_last_sequence,
+            engine,
+        ),
     )
         .into_response())
 }
@@ -278,6 +294,7 @@ where
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct RenameBody {
     new_name: String,
     nx: Option<bool>,
@@ -362,6 +379,7 @@ where
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SetObjectBody {
     object: latlng_core::geo::GeoType,
     #[serde(default)]
@@ -432,6 +450,7 @@ where
     ensure_queries_allowed(&state)?;
     let output = parse_output_format(query.format.as_deref(), query.hash_precision)?;
     let with_fields = query.with_fields.unwrap_or(false);
+    let missing = format!("object not found: {collection}/{id}");
     let object = run_db(&state.executor, move |db| {
         db.get(
             &collection,
@@ -442,7 +461,8 @@ where
             },
         )
     })
-    .await?;
+    .await?
+    .ok_or(HttpError::NotFound(missing))?;
     Ok(Json(serde_json::to_value(object).map_err(internal)?))
 }
 
@@ -497,6 +517,7 @@ where
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct FsetBody {
     fields: Vec<FieldEntry>,
     xx: Option<bool>,
@@ -554,6 +575,7 @@ where
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ExpireBody {
     seconds: u32,
 }
@@ -629,6 +651,7 @@ where
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct JsetBody {
     path: String,
     value: String,
@@ -732,6 +755,7 @@ where
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct AreaSearchBody {
     area: latlng_core::geo::Area,
     #[serde(default)]
@@ -833,6 +857,7 @@ where
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SetChannelBody {
     name: String,
     def: GeofenceDef,
@@ -969,6 +994,7 @@ where
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct SetHookBody {
     name: String,
     endpoint: String,
@@ -1082,6 +1108,7 @@ where
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ConfigValue {
     value: String,
 }
@@ -1441,6 +1468,7 @@ where
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct ReadOnlyBody {
     enabled: bool,
 }
@@ -1469,6 +1497,7 @@ where
 }
 
 #[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
 pub(crate) struct TimeoutBody {
     seconds: f64,
     command: String,

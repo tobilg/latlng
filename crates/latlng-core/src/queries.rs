@@ -2,6 +2,9 @@ use super::*;
 
 impl<P: Platform, S: StorageBackend> LatLng<P, S> {
     pub fn nearby(&self, collection: &str, query: NearbyQuery) -> Result<SearchResults> {
+        validate_lat_lon(query.lat, query.lon)?;
+        validate_meters(query.meters)?;
+        query.options.validate()?;
         let _gate = self.read_control();
         let handle = self.existing_collection_handle(collection)?;
         if query.options.fast_limited_ids() && !query.options.has_filters() {
@@ -66,6 +69,8 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
         area: Area,
         options: SearchOptions,
     ) -> Result<SearchResults> {
+        area.validate()?;
+        options.validate()?;
         let _gate = self.read_control();
         let resolved_area = self.resolve_area(area)?;
         let handle = self.existing_collection_handle(collection)?;
@@ -134,6 +139,8 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
         area: Area,
         options: SearchOptions,
     ) -> Result<SearchResults> {
+        area.validate()?;
+        options.validate()?;
         let _gate = self.read_control();
         let resolved_area = self.resolve_area(area)?;
         let handle = self.existing_collection_handle(collection)?;
@@ -202,6 +209,7 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
     }
 
     pub fn scan(&self, collection: &str, options: SearchOptions) -> Result<SearchResults> {
+        options.validate()?;
         let _gate = self.read_control();
         let handle = self.existing_collection_handle(collection)?;
         {
@@ -265,6 +273,7 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
     }
 
     pub fn search(&self, collection: &str, options: SearchOptions) -> Result<SearchResults> {
+        options.validate()?;
         let _gate = self.read_control();
         let handle = self.existing_collection_handle(collection)?;
         {

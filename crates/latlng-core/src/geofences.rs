@@ -2,6 +2,7 @@ use super::*;
 
 impl<P: Platform, S: StorageBackend> LatLng<P, S> {
     pub fn setchan(&self, name: &str, def: GeofenceDef) -> Result<()> {
+        validate_geofence_def(&def)?;
         let _gate = self.write_control();
         self.ensure_writable()?;
         self.append_log_record(LogRecord::Command(Command::SetChannel {
@@ -46,6 +47,7 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
     }
 
     pub fn sethook(&self, name: &str, endpoint: &str, def: GeofenceDef) -> Result<()> {
+        validate_geofence_def(&def)?;
         let _gate = self.write_control();
         self.ensure_writable()?;
         self.append_log_record(LogRecord::Command(Command::SetHook {
@@ -73,6 +75,12 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
             pattern: pattern.to_owned(),
         }))?;
         Ok(P::write(&self.geofences).pdel_hook(pattern))
+    }
+
+    /// Number of per-fence evaluation errors that were contained instead of
+    /// failing the triggering write.
+    pub fn geofence_eval_errors_total(&self) -> u64 {
+        P::read(&self.geofences).eval_errors_total()
     }
 
     pub fn hooks(&self, pattern: &str) -> Result<Vec<HookInfo>> {

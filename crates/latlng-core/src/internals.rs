@@ -217,7 +217,7 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
         let object = Object {
             id: req.id.clone(),
             geo: req.object.clone(),
-            fields: field_entries_to_map(&req.fields),
+            fields: merged_set_fields(before.as_ref(), &req.fields),
             expires_at,
         };
         let event = MutationEvent {
@@ -225,7 +225,7 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
             collection: req.collection.clone(),
             id: req.id.clone(),
             before,
-            after: Some(object),
+            after: Some(object.clone()),
             timestamp_ns: now_nanos(),
         };
         let planned = self.plan_mutation(&event)?;
@@ -236,7 +236,7 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
                 collection: req.collection.clone(),
                 id: req.id.clone(),
                 object: req.object.clone(),
-                fields: req.fields.clone(),
+                fields: field_map_to_entries(&object.fields),
                 expires_at_ms: expires_at,
             }),
             &webhook_records,

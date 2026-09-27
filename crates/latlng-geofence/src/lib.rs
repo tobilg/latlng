@@ -124,6 +124,7 @@ pub enum GeofenceQuery {
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct GeofenceDef {
     pub collection: String,
     pub query: GeofenceQuery,
@@ -186,12 +187,14 @@ pub struct GeofenceRegistry<P: Platform> {
     cross_collection_roaming_collections: HashSet<String>,
     subscribers: Vec<Subscriber<P>>,
     generation: P::Shared<P::RwLock<u64>>,
+    eval_errors_total: u64,
 }
 
 pub struct PreparedMutation {
     channel_states: Vec<(String, StoredStateUpdate)>,
     hook_states: Vec<(String, StoredStateUpdate)>,
     events: Vec<GeofenceEvent>,
+    eval_errors: u64,
 }
 
 impl PreparedMutation {
@@ -261,6 +264,7 @@ impl<P: Platform> Default for GeofenceRegistry<P> {
             cross_collection_roaming_collections: HashSet::new(),
             subscribers: Vec::new(),
             generation: P::shared(P::new_rwlock(0_u64)),
+            eval_errors_total: 0,
         }
     }
 }
@@ -504,47 +508,71 @@ impl<P: Platform> GeofenceRegistry<P> {
         let mut channel_states = Vec::with_capacity(channel_names.len());
         let mut hook_states = Vec::with_capacity(hook_names.len());
         let mut events = Vec::new();
+        let mut eval_errors = 0_u64;
 
+        // A fence that fails to evaluate is skipped (no events, state unchanged)
+        // so a single bad definition can never fail the triggering write.
         for name in channel_names {
             let Some(stored) = self.channels.get(&name) else {
                 continue;
             };
-            let (state_update, produced) = evaluate_stored_fence(
+            match evaluate_stored_fence(
                 &stored.def,
                 &stored.state,
                 event,
                 Some(&name),
                 None,
                 lookup,
-            )?;
-            events.extend(produced);
-            channel_states.push((name, state_update));
+            ) {
+                Ok((state_update, produced)) => {
+                    events.extend(produced);
+                    channel_states.push((name, state_update));
+                }
+                Err(error) => {
+                    eval_errors += 1;
+                    tracing::warn!(channel = %name, %error, "geofence evaluation failed; skipping channel");
+                }
+            }
         }
 
         for name in hook_names {
             let Some(stored) = self.hooks.get(&name) else {
                 continue;
             };
-            let (state_update, produced) = evaluate_stored_fence(
+            match evaluate_stored_fence(
                 &stored.def,
                 &stored.state,
                 event,
                 Some(&name),
                 Some(&name),
                 lookup,
-            )?;
-            events.extend(produced);
-            hook_states.push((name, state_update));
+            ) {
+                Ok((state_update, produced)) => {
+                    events.extend(produced);
+                    hook_states.push((name, state_update));
+                }
+                Err(error) => {
+                    eval_errors += 1;
+                    tracing::warn!(hook = %name, %error, "geofence evaluation failed; skipping hook");
+                }
+            }
         }
 
         Ok(PreparedMutation {
             channel_states,
             hook_states,
             events,
+            eval_errors,
         })
     }
 
+    /// Total number of per-fence evaluation errors that were contained.
+    pub fn eval_errors_total(&self) -> u64 {
+        self.eval_errors_total
+    }
+
     pub fn apply_prepared_mutation(&mut self, prepared: PreparedMutation) {
+        self.eval_errors_total = self.eval_errors_total.saturating_add(prepared.eval_errors);
         for (name, state_update) in prepared.channel_states {
             if let Some(stored) = self.channels.get_mut(&name) {
                 state_update.apply(&mut stored.state);
@@ -1211,7 +1239,7 @@ fn crossed_boundary(event: &MutationEvent, def: &GeofenceDef) -> GeofenceResult<
 
 #[cfg(test)]
 mod tests {
-    use latlng_geo::{FieldMap, GeoType, Object};
+    use latlng_geo::{Area, FieldMap, GeoType, Object};
     use latlng_index::SearchOptions;
     use latlng_platform::NativePlatform;
 
@@ -1257,6 +1285,49 @@ mod tests {
             .unwrap();
         assert_eq!(events.len(), 1);
         assert_eq!(receiver.try_recv().unwrap().detect, DetectType::Enter);
+    }
+
+    #[test]
+    fn fence_evaluation_errors_are_contained() {
+        let mut registry = GeofenceRegistry::<NativePlatform>::new();
+        let unresolvable = GeofenceDef {
+            collection: "fleet".to_owned(),
+            query: GeofenceQuery::Within {
+                area: Area::Reference {
+                    collection: "zones".to_owned(),
+                    id: "z1".to_owned(),
+                },
+                options: SearchOptions::default(),
+            },
+            detect: Vec::new(),
+            commands: Vec::new(),
+        };
+        registry.set_hook("broken", "http://127.0.0.1:9/x", unresolvable.clone());
+        registry.set_channel("broken", unresolvable);
+        registry.set_channel(
+            "healthy",
+            GeofenceDef {
+                collection: "fleet".to_owned(),
+                query: GeofenceQuery::Nearby {
+                    lat: 52.52,
+                    lon: 13.405,
+                    meters: 100.0,
+                    options: SearchOptions::default(),
+                },
+                detect: Vec::new(),
+                commands: Vec::new(),
+            },
+        );
+
+        let events = registry
+            .evaluate_mutation(
+                &mutation("fleet", "truck-1", None, Some(point(52.52, 13.405)), 1),
+                &|_| Vec::new(),
+            )
+            .unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].group.as_deref(), Some("healthy"));
+        assert_eq!(registry.eval_errors_total(), 2);
     }
 
     #[test]

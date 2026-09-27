@@ -10,6 +10,8 @@ use latlng_replication::SharedReplicationStatus;
 use tokio::sync::Notify;
 
 use crate::codec::{capnp_failed, forbidden_error, unauthorized_error};
+use crate::error::CallError;
+use crate::rpc;
 use crate::runtime::snapshot_replication_status;
 use crate::service::{CapnpAuthConfig, CapnpRuntimeBindings};
 
@@ -124,7 +126,7 @@ where
         }
     }
 
-    pub(crate) async fn run_core<T, F>(&self, op: F) -> Result<T, capnp::Error>
+    pub(crate) async fn run_core<T, F>(&self, op: F) -> Result<T, CallError>
     where
         T: Send + 'static,
         F: FnOnce(&LatLngNative<S>) -> latlng_core::Result<T> + Send + 'static,
@@ -132,8 +134,8 @@ where
         self.executor
             .execute(op)
             .await
-            .map_err(|error| capnp::Error::failed(error.to_string()))?
-            .map_err(|error| capnp::Error::failed(error.to_string()))
+            .map_err(|error| CallError::new(rpc::ErrorCode::Unavailable, error))?
+            .map_err(CallError::from)
     }
 
     pub(crate) async fn run_value<T, F>(&self, op: F) -> Result<T, capnp::Error>
@@ -147,16 +149,17 @@ where
             .map_err(|error| capnp::Error::failed(error.to_string()))
     }
 
-    pub(crate) async fn run_core_read<T, F>(&self, op: F) -> Result<T, capnp::Error>
+    pub(crate) async fn run_core_read<T, F>(&self, op: F) -> Result<T, CallError>
     where
         T: Send + 'static,
         F: FnOnce(&LatLngNative<S>) -> latlng_core::Result<T> + Send + 'static,
     {
-        self.ensure_queries_allowed()?;
+        self.ensure_queries_allowed()
+            .map_err(|error| CallError::new(rpc::ErrorCode::Unavailable, error))?;
         self.run_core(op).await
     }
 
-    pub(crate) async fn run_core_mutating<T, F>(&self, op: F) -> Result<T, capnp::Error>
+    pub(crate) async fn run_core_mutating<T, F>(&self, op: F) -> Result<T, CallError>
     where
         T: Send + 'static,
         F: FnOnce(&LatLngNative<S>) -> latlng_core::Result<T> + Send + 'static,

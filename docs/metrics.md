@@ -26,6 +26,8 @@
 | `latlng_webhook_jobs_leased` | gauge | Current leased webhook jobs. |
 | `latlng_webhook_jobs_dead_letter` | gauge | Current dead-letter webhook jobs. |
 | `latlng_webhook_oldest_pending_age_ms` | gauge | Oldest pending webhook job age in milliseconds. Omitted from the exposition when no pending job exists. |
+| `latlng_geofence_eval_errors_total` | counter | Geofence evaluations that failed and were skipped without failing the triggering write. |
+| `latlng_expired_objects_total` | counter | Objects deleted by the background expiry sweep. |
 | `latlng_replication_role` | gauge | Replication role: `0` means leader, `1` means follower. |
 | `latlng_replication_caught_up` | gauge | `1` when the node is caught up with its leader, otherwise `0`. |
 | `latlng_replication_local_last_sequence` | gauge | Last local committed sequence known to replication. |

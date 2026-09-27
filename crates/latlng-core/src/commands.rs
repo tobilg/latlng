@@ -16,13 +16,13 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
             && matches!(req.object, GeoType::Point { .. })
             && !self.collection_has_geofence_side_effects(&req.collection)
         {
+            let mut collection = P::write(&*handle);
             let object = Object {
                 id: req.id.clone(),
                 geo: req.object.clone(),
-                fields: field_entries_to_map(&req.fields),
+                fields: merged_set_fields(collection.collection.objects.get(&req.id), &req.fields),
                 expires_at: None,
             };
-            let mut collection = P::write(&*handle);
             self.reserve_sequences(1);
             collection.collection.upsert(object)?;
             collection.version = collection.version.saturating_add(1);
@@ -50,7 +50,7 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
             let object = Object {
                 id: req.id.clone(),
                 geo: req.object.clone(),
-                fields: field_entries_to_map(&req.fields),
+                fields: merged_set_fields(before.as_ref(), &req.fields),
                 expires_at,
             };
             let event = MutationEvent {
@@ -74,7 +74,7 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
                     collection: req.collection.clone(),
                     id: req.id.clone(),
                     object: req.object.clone(),
-                    fields: req.fields.clone(),
+                    fields: field_map_to_entries(&object.fields),
                     expires_at_ms: expires_at,
                 }),
                 &webhook_records,
@@ -106,7 +106,7 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
         let object = Object {
             id: req.id.clone(),
             geo: req.object.clone(),
-            fields: field_entries_to_map(&req.fields),
+            fields: merged_set_fields(before.as_ref(), &req.fields),
             expires_at,
         };
         let event = MutationEvent {
@@ -125,7 +125,7 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
                 collection: req.collection.clone(),
                 id: req.id.clone(),
                 object: req.object.clone(),
-                fields: req.fields.clone(),
+                fields: field_map_to_entries(&object.fields),
                 expires_at_ms: expires_at,
             }),
             &webhook_records,
@@ -218,9 +218,7 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
                 };
             };
             let mut after = before.clone();
-            for field in fields {
-                after.fields.insert(field.name.clone(), field.value.clone());
-            }
+            apply_field_updates(&mut after.fields, fields);
             let event = MutationEvent {
                 command: MutationCommand::Fset,
                 collection: collection.to_owned(),
@@ -280,9 +278,7 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
             object.clone()
         };
         let mut after = before.clone();
-        for field in fields {
-            after.fields.insert(field.name.clone(), field.value.clone());
-        }
+        apply_field_updates(&mut after.fields, fields);
         let event = MutationEvent {
             command: MutationCommand::Fset,
             collection: collection.to_owned(),
@@ -351,10 +347,9 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
                 id: id.to_owned(),
                 expires_at_ms,
             }))?;
-            let Some(object) = state.collection.objects.get_mut(id) else {
+            if !state.collection.set_expiry(id, Some(expires_at_ms)) {
                 continue;
-            };
-            object.expires_at = Some(expires_at_ms);
+            }
             state.version = state.version.saturating_add(1);
             return Ok(true);
         }
@@ -370,16 +365,12 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
             expires_at_ms,
         }))?;
         let mut state = P::write(&*handle);
-        let object =
-            state
-                .collection
-                .objects
-                .get_mut(id)
-                .ok_or_else(|| CoreError::ObjectNotFound {
-                    collection: collection.to_owned(),
-                    id: id.to_owned(),
-                })?;
-        object.expires_at = Some(expires_at_ms);
+        if !state.collection.set_expiry(id, Some(expires_at_ms)) {
+            return Err(CoreError::ObjectNotFound {
+                collection: collection.to_owned(),
+                id: id.to_owned(),
+            });
+        }
         state.version = state.version.saturating_add(1);
         Ok(())
     }
@@ -407,10 +398,9 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
                 collection: collection.to_owned(),
                 id: id.to_owned(),
             }))?;
-            let Some(object) = state.collection.objects.get_mut(id) else {
+            if !state.collection.set_expiry(id, None) {
                 continue;
-            };
-            object.expires_at = None;
+            }
             state.version = state.version.saturating_add(1);
             return Ok(true);
         }
@@ -424,16 +414,12 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
             id: id.to_owned(),
         }))?;
         let mut state = P::write(&*handle);
-        let object =
-            state
-                .collection
-                .objects
-                .get_mut(id)
-                .ok_or_else(|| CoreError::ObjectNotFound {
-                    collection: collection.to_owned(),
-                    id: id.to_owned(),
-                })?;
-        object.expires_at = None;
+        if !state.collection.set_expiry(id, None) {
+            return Err(CoreError::ObjectNotFound {
+                collection: collection.to_owned(),
+                id: id.to_owned(),
+            });
+        }
         state.version = state.version.saturating_add(1);
         Ok(())
     }
@@ -446,61 +432,21 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
         value: &str,
         raw: bool,
     ) -> Result<bool> {
-        self.ensure_writable()?;
-        let handle = self.existing_collection_handle(collection)?;
-        let payload = if raw {
-            serde_json::from_str(value)
-                .unwrap_or_else(|_| serde_json::Value::String(value.to_owned()))
-        } else {
-            serde_json::Value::String(value.to_owned())
-        };
-
-        loop {
-            let version =
-                {
-                    let state = P::read(&*handle);
-                    let object = state.collection.objects.get(id).ok_or_else(|| {
-                        CoreError::ObjectNotFound {
-                            collection: collection.to_owned(),
-                            id: id.to_owned(),
-                        }
-                    })?;
-                    if !matches!(object.geo, GeoType::GeoJson(_)) {
-                        return Err(CoreError::Message(
-                            "JSET requires a GeoJSON object".to_owned(),
-                        ));
-                    }
-                    state.version
-                };
-            let mut state = P::write(&*handle);
-            if state.version != version {
-                continue;
-            }
-            self.append_log_record(LogRecord::Command(Command::Jset {
+        let payload = jset_payload(value, raw);
+        self.edit_geojson_local(
+            collection,
+            id,
+            "JSET",
+            |json| set_json_path(json, path, payload.clone()).map(|()| true),
+            Command::Jset {
                 collection: collection.to_owned(),
                 id: id.to_owned(),
                 path: path.to_owned(),
                 value: value.to_owned(),
                 raw,
-            }))?;
-            let json = match state
-                .collection
-                .objects
-                .get_mut(id)
-                .map(|object| &mut object.geo)
-            {
-                Some(GeoType::GeoJson(value)) => value,
-                Some(_) => {
-                    return Err(CoreError::Message(
-                        "JSET requires a GeoJSON object".to_owned(),
-                    ));
-                }
-                None => continue,
-            };
-            set_json_path(json, path, payload.clone())?;
-            state.version = state.version.saturating_add(1);
-            return Ok(true);
-        }
+            },
+        )
+        .map(|_| true)
     }
 
     pub(crate) fn jset_exclusive(
@@ -511,44 +457,21 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
         value: &str,
         raw: bool,
     ) -> Result<()> {
-        self.ensure_writable()?;
-        let handle = self.existing_collection_handle(collection)?;
-        self.append_log_record(LogRecord::Command(Command::Jset {
-            collection: collection.to_owned(),
-            id: id.to_owned(),
-            path: path.to_owned(),
-            value: value.to_owned(),
-            raw,
-        }))?;
-        let payload = if raw {
-            serde_json::from_str(value)
-                .unwrap_or_else(|_| serde_json::Value::String(value.to_owned()))
-        } else {
-            serde_json::Value::String(value.to_owned())
-        };
-        let mut state = P::write(&*handle);
-        let json = match state
-            .collection
-            .objects
-            .get_mut(id)
-            .map(|object| &mut object.geo)
-        {
-            Some(GeoType::GeoJson(value)) => value,
-            Some(_) => {
-                return Err(CoreError::Message(
-                    "JSET requires a GeoJSON object".to_owned(),
-                ));
-            }
-            None => {
-                return Err(CoreError::ObjectNotFound {
-                    collection: collection.to_owned(),
-                    id: id.to_owned(),
-                });
-            }
-        };
-        set_json_path(json, path, payload)?;
-        state.version = state.version.saturating_add(1);
-        Ok(())
+        let payload = jset_payload(value, raw);
+        self.edit_geojson_local(
+            collection,
+            id,
+            "JSET",
+            |json| set_json_path(json, path, payload.clone()).map(|()| true),
+            Command::Jset {
+                collection: collection.to_owned(),
+                id: id.to_owned(),
+                path: path.to_owned(),
+                value: value.to_owned(),
+                raw,
+            },
+        )
+        .map(|_| ())
     }
 
     pub(crate) fn try_jdel_local(
@@ -557,11 +480,44 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
         id: &str,
         path: &str,
     ) -> Result<Option<bool>> {
+        self.jdel_exclusive(collection, id, path).map(Some)
+    }
+
+    pub(crate) fn jdel_exclusive(&self, collection: &str, id: &str, path: &str) -> Result<bool> {
+        self.edit_geojson_local(
+            collection,
+            id,
+            "JDEL",
+            |json| delete_json_path(json, path),
+            Command::Jdel {
+                collection: collection.to_owned(),
+                id: id.to_owned(),
+                path: path.to_owned(),
+            },
+        )
+    }
+
+    /// Applies a JSON-path edit to a stored GeoJSON object. The edit runs on a
+    /// copy first and the result must still be a valid geometry with in-range
+    /// coordinates; only then is the command logged and the object replaced
+    /// (which also refreshes its spatial index entry). An invalid edit fails
+    /// without touching the log or the stored object.
+    ///
+    /// The edit keeps the object's fields but clears its TTL.
+    /// The TTL removal is logged as a `Persist` in the same batch, so replaying
+    /// logs written before this behaviour keeps their original TTLs.
+    fn edit_geojson_local(
+        &self,
+        collection: &str,
+        id: &str,
+        command_name: &str,
+        edit: impl Fn(&mut serde_json::Value) -> std::result::Result<bool, GeoError>,
+        command: Command,
+    ) -> Result<bool> {
         self.ensure_writable()?;
         let handle = self.existing_collection_handle(collection)?;
-
         loop {
-            let version =
+            let (version, edited, changed, had_ttl) =
                 {
                     let state = P::read(&*handle);
                     let object = state.collection.objects.get(id).ok_or_else(|| {
@@ -570,76 +526,42 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
                             id: id.to_owned(),
                         }
                     })?;
-                    if !matches!(object.geo, GeoType::GeoJson(_)) {
-                        return Err(CoreError::Message(
-                            "JDEL requires a GeoJSON object".to_owned(),
-                        ));
-                    }
-                    state.version
+                    let GeoType::GeoJson(json) = &object.geo else {
+                        return Err(CoreError::Invalid(format!(
+                            "{command_name} requires a GeoJSON object"
+                        )));
+                    };
+                    let mut json = json.clone();
+                    let changed = edit(&mut json)?;
+                    let edited = GeoType::GeoJson(json);
+                    edited.validate()?;
+                    edited.to_geometry()?;
+                    (state.version, edited, changed, object.expires_at.is_some())
                 };
             let mut state = P::write(&*handle);
             if state.version != version {
                 continue;
             }
-            self.append_log_record(LogRecord::Command(Command::Jdel {
-                collection: collection.to_owned(),
-                id: id.to_owned(),
-                path: path.to_owned(),
-            }))?;
-            let json = match state
-                .collection
-                .objects
-                .get_mut(id)
-                .map(|object| &mut object.geo)
-            {
-                Some(GeoType::GeoJson(value)) => value,
-                Some(_) => {
-                    return Err(CoreError::Message(
-                        "JDEL requires a GeoJSON object".to_owned(),
-                    ));
-                }
-                None => continue,
-            };
-            let deleted = delete_json_path(json, path)?;
+            let mut records = vec![LogRecord::Command(command)];
+            if had_ttl {
+                records.push(LogRecord::Command(Command::Persist {
+                    collection: collection.to_owned(),
+                    id: id.to_owned(),
+                }));
+            }
+            self.append_log_records(&records)?;
+            state.collection.replace_geo(id, edited)?;
+            if had_ttl {
+                state.collection.set_expiry(id, None);
+            }
             state.version = state.version.saturating_add(1);
-            return Ok(Some(deleted));
+            return Ok(changed);
         }
     }
 
-    pub(crate) fn jdel_exclusive(&self, collection: &str, id: &str, path: &str) -> Result<bool> {
-        self.ensure_writable()?;
-        let handle = self.existing_collection_handle(collection)?;
-        self.append_log_record(LogRecord::Command(Command::Jdel {
-            collection: collection.to_owned(),
-            id: id.to_owned(),
-            path: path.to_owned(),
-        }))?;
-        let mut state = P::write(&*handle);
-        let json = match state
-            .collection
-            .objects
-            .get_mut(id)
-            .map(|object| &mut object.geo)
-        {
-            Some(GeoType::GeoJson(value)) => value,
-            Some(_) => {
-                return Err(CoreError::Message(
-                    "JDEL requires a GeoJSON object".to_owned(),
-                ));
-            }
-            None => {
-                return Err(CoreError::ObjectNotFound {
-                    collection: collection.to_owned(),
-                    id: id.to_owned(),
-                });
-            }
-        };
-        let deleted = delete_json_path(json, path)?;
-        state.version = state.version.saturating_add(1);
-        Ok(deleted)
-    }
-
     pub fn set(&self, req: SetRequest) -> Result<bool> {
+        // Only new writes are validated; replay loads existing data unchanged.
+        req.object.validate()?;
         {
             let _gate = self.read_control();
             if let Some(result) = self.try_set_local(&req)? {
@@ -994,7 +916,9 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
             return Ok(None);
         };
         let Some(json) = object.geo.json_value() else {
-            return Ok(None);
+            return Err(CoreError::Invalid(
+                "JGET requires a GeoJSON object".to_owned(),
+            ));
         };
         Ok(get_json_path(json, path).map(|value| value.to_string()))
     }
@@ -1008,5 +932,13 @@ impl<P: Platform, S: StorageBackend> LatLng<P, S> {
         }
         let _gate = self.write_control();
         self.jdel_exclusive(collection, id, path)
+    }
+}
+
+fn jset_payload(value: &str, raw: bool) -> serde_json::Value {
+    if raw {
+        serde_json::from_str(value).unwrap_or_else(|_| serde_json::Value::String(value.to_owned()))
+    } else {
+        serde_json::Value::String(value.to_owned())
     }
 }

@@ -2,8 +2,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use axum::http::{HeaderName, HeaderValue, Method};
+use axum::http::{HeaderName, HeaderValue, Method, StatusCode};
 use axum::middleware::{from_fn, from_fn_with_state};
+use axum::response::Response;
 use axum::routing::{delete, get, post};
 use latlng_auth::Authenticator;
 use latlng_config::RuntimeConfig;
@@ -18,7 +19,7 @@ use crate::middleware::{
     principal_rate_limit_middleware, rate_limit_middleware, request_context_middleware,
     request_timeout_middleware,
 };
-use crate::{HttpState, RequestMetrics};
+use crate::{HttpError, HttpState, RequestMetrics, json_error_response};
 
 pub struct StableHttpRoute {
     pub method: &'static str,
@@ -346,6 +347,14 @@ fn cors_layer(config: &RuntimeConfig) -> Result<CorsLayer, String> {
     Ok(cors)
 }
 
+async fn route_not_found() -> HttpError {
+    HttpError::NotFound("no such route".to_owned())
+}
+
+async fn method_not_allowed() -> Response {
+    json_error_response(StatusCode::METHOD_NOT_ALLOWED, "method not allowed")
+}
+
 pub fn router<S>(state: HttpState<S>) -> Router
 where
     S: StorageBackend + Send + Sync + 'static,
@@ -419,6 +428,8 @@ where
         .route("/admin/config/rewrite", post(config_rewrite::<S>))
         .route("/admin/readonly", post(readonly::<S>))
         .route("/admin/timeout", post(timeout::<S>))
+        .fallback(route_not_found)
+        .method_not_allowed_fallback(method_not_allowed)
         .layer(from_fn_with_state(state.clone(), metrics_middleware::<S>))
         .layer(from_fn(request_context_middleware))
         .with_state(state)

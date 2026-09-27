@@ -46,6 +46,135 @@ fn server_version_exits_without_starting_server() {
     );
 }
 
+#[test]
+fn server_help_exits_without_starting_server() {
+    let dir = tempdir().unwrap();
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_latlng-server"))
+        .arg("--help")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(output.status.success());
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("--capnp-enabled"), "stdout: {stdout}");
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[test]
+fn server_rejects_unknown_flags() {
+    let dir = tempdir().unwrap();
+    let output = StdCommand::new(env!("CARGO_BIN_EXE_latlng-server"))
+        .arg("--reqiure-auth")
+        .current_dir(dir.path())
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    assert!(String::from_utf8_lossy(&output.stderr).contains("--reqiure-auth"));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn expired_objects_are_swept_and_fire_del_webhooks() {
+    let local = LocalSet::new();
+    local
+        .run_until(async {
+            let dir = tempdir().unwrap();
+            let http_port = free_port();
+            let capnp_port = free_port();
+            let hook_port = free_port();
+            let aof_path = dir.path().join("appendonly.aof");
+            let config_path = dir.path().join("latlng.json");
+            write_config(&config_path, http_port, capnp_port, &aof_path);
+
+            let hook_state = HookState::default();
+            let listener = tokio::net::TcpListener::bind(("127.0.0.1", hook_port))
+                .await
+                .unwrap();
+            let app = Router::new()
+                .route("/hook", post(fast_hook))
+                .with_state(hook_state.clone());
+            let hook_server = tokio::spawn(async move {
+                let _ = axum::serve(listener, app).await;
+            });
+
+            let mut child = spawn_server(&config_path).await;
+            let client = reqwest::Client::new();
+            let base = format!("http://127.0.0.1:{http_port}");
+            wait_for_ping(&client, &base).await;
+
+            let response = client
+                .post(format!("{base}/hooks"))
+                .header(AUTHORIZATION, "Bearer secret")
+                .json(&serde_json::json!({
+                    "name": "expiry-hook",
+                    "endpoint": format!("http://127.0.0.1:{hook_port}/hook"),
+                    "def": {
+                        "collection": "fleet",
+                        "query": {"Nearby": {"lat": 52.52, "lon": 13.405, "meters": 500.0, "options": {}}},
+                        "detect": [],
+                        "commands": ["Del"]
+                    }
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            let response = client
+                .post(format!("{base}/collections/fleet/objects/ttl"))
+                .header(AUTHORIZATION, "Bearer secret")
+                .json(&serde_json::json!({
+                    "object": {"Point": {"lat": 52.52, "lon": 13.405, "z": null}},
+                    "expire_seconds": 1
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert!(response.status().is_success());
+            assert_eq!(hook_state.delivered.load(Ordering::Relaxed), 0);
+
+            wait_for_hook_deliveries(&hook_state, 1).await;
+            let metrics = client
+                .get(format!("{base}/metrics"))
+                .header(AUTHORIZATION, "Bearer secret")
+                .send()
+                .await
+                .unwrap();
+            let metrics = response_text(metrics).await;
+            assert_eq!(metric_value(&metrics, "latlng_expired_objects_total"), Some(1));
+
+            child.kill().await.unwrap();
+            let _ = child.wait().await;
+            hook_server.abort();
+            let _ = hook_server.await;
+        })
+        .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn memory_mode_creates_no_files_in_working_directory() {
+    let dir = tempdir().unwrap();
+    let http_port = free_port();
+    let mut server = Command::new(env!("CARGO_BIN_EXE_latlng-server"))
+        .kill_on_drop(true)
+        .current_dir(dir.path())
+        .args(["--memory", "--no-capnp", "--listen"])
+        .arg(format!("127.0.0.1:{http_port}"))
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    let client = reqwest::Client::new();
+    wait_for_ping(&client, &format!("http://127.0.0.1:{http_port}")).await;
+    server.kill().await.unwrap();
+    let _ = server.wait().await;
+
+    let entries = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| entry.unwrap().file_name())
+        .collect::<Vec<_>>();
+    assert!(entries.is_empty(), "unexpected files: {entries:?}");
+}
+
 #[tokio::test(flavor = "current_thread")]
 async fn server_supports_http_ws_capnp_and_config_rewrite() {
     let local = LocalSet::new();
@@ -831,6 +960,73 @@ async fn follower_catches_up_and_rejects_writes() {
                 .unwrap();
             assert_eq!(write.status(), StatusCode::BAD_REQUEST);
 
+            // Expiry runs on the leader only; the follower applies the
+            // replicated delete and never expires objects itself.
+            let ttl = client
+                .post(format!("{leader_base}/collections/fleet/objects/ttl"))
+                .header(AUTHORIZATION, "Bearer secret")
+                .json(&serde_json::json!({
+                    "object": {"Point": {"lat": 52.52, "lon": 13.405, "z": null}},
+                    "expire_seconds": 1
+                }))
+                .send()
+                .await
+                .unwrap();
+            assert!(ttl.status().is_success());
+            let expired_on = |base: String| {
+                let client = client.clone();
+                async move {
+                    let metrics = client
+                        .get(format!("{base}/metrics"))
+                        .header(AUTHORIZATION, "Bearer secret")
+                        .send()
+                        .await
+                        .unwrap();
+                    metric_value(
+                        &response_text(metrics).await,
+                        "latlng_expired_objects_total",
+                    )
+                }
+            };
+            let mut leader_expired = None;
+            for _ in 0..100 {
+                leader_expired = expired_on(leader_base.clone()).await;
+                if leader_expired == Some(1) {
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(leader_expired, Some(1));
+            let leader_sequence = response_json(
+                client
+                    .get(format!("{leader_base}/server"))
+                    .header(AUTHORIZATION, "Bearer secret")
+                    .send()
+                    .await
+                    .unwrap(),
+            )
+            .await["last_sequence"]
+                .clone();
+            let mut follower_sequence = serde_json::Value::Null;
+            for _ in 0..100 {
+                follower_sequence = response_json(
+                    client
+                        .get(format!("{follower_base}/server"))
+                        .header(AUTHORIZATION, "Bearer secret")
+                        .send()
+                        .await
+                        .unwrap(),
+                )
+                .await["last_sequence"]
+                    .clone();
+                if follower_sequence == leader_sequence {
+                    break;
+                }
+                sleep(Duration::from_millis(50)).await;
+            }
+            assert_eq!(follower_sequence, leader_sequence);
+            assert_eq!(expired_on(follower_base.clone()).await, Some(0));
+
             leader.kill().await.unwrap();
             let _ = leader.wait().await;
             follower.kill().await.unwrap();
@@ -978,9 +1174,7 @@ async fn follower_checksum_mismatch_triggers_resync() {
                 .send()
                 .await
                 .unwrap();
-            assert_eq!(local_only.status(), StatusCode::OK);
-            let local_only = response_json(local_only).await;
-            assert_eq!(local_only, serde_json::Value::Null);
+            assert_eq!(local_only.status(), StatusCode::NOT_FOUND);
 
             leader.kill().await.unwrap();
             let _ = leader.wait().await;
@@ -1070,6 +1264,56 @@ async fn server_preserves_acknowledged_concurrent_writes_across_sigterm() {
             let _ = second.wait().await;
         })
         .await;
+}
+
+#[tokio::test(flavor = "current_thread")]
+async fn legacy_reference_hook_in_aof_does_not_block_writes() {
+    use latlng_core::storage::{StorageBackend, StorageEntry};
+
+    let dir = tempdir().unwrap();
+    let http_port = free_port();
+    let capnp_port = free_port();
+    let aof_path = dir.path().join("appendonly.aof");
+    let config_path = dir.path().join("latlng.json");
+    write_config(&config_path, http_port, capnp_port, &aof_path);
+
+    // Hooks with reference areas could be registered before v0.2.0.
+    let record = serde_json::json!({"Command": {"SetHook": {
+        "name": "ref",
+        "endpoint": "http://127.0.0.1:9/x",
+        "def": {
+            "collection": "fleet",
+            "query": {"Within": {"area": {"Reference": {"collection": "zones", "id": "z1"}}, "options": {}}},
+            "detect": ["Enter"],
+            "commands": ["Set"]
+        }
+    }}});
+    let backend = latlng_storage_aof::AofBackend::open(&aof_path).unwrap();
+    backend
+        .append(&StorageEntry {
+            sequence: 1,
+            timestamp_ns: 1,
+            command: serde_json::to_vec(&record).unwrap().into(),
+        })
+        .unwrap();
+    drop(backend);
+
+    let client = reqwest::Client::new();
+    let base = format!("http://127.0.0.1:{http_port}");
+    let mut server = spawn_server(&config_path).await;
+    wait_for_ping(&client, &base).await;
+
+    set_point_for_id(&client, &base, "v1", 10.0, 10.0).await;
+    let hooks = client
+        .get(format!("{base}/hooks"))
+        .header(AUTHORIZATION, "Bearer secret")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response_json(hooks).await, serde_json::json!([]));
+
+    server.kill().await.unwrap();
+    let _ = server.wait().await;
 }
 
 fn write_config(path: &Path, http_port: u16, capnp_port: u16, aof_path: &Path) {
@@ -1197,7 +1441,9 @@ async fn send_sigterm(child: &mut Child) {
 }
 
 async fn wait_for_ping(client: &reqwest::Client, base: &str) {
-    for _ in 0..60 {
+    // Generous budget: the first launch of a freshly linked binary can be slow
+    // (for example while macOS scans it), and CI runners are often loaded.
+    for _ in 0..300 {
         let response = client
             .get(format!("{base}/ping"))
             .header(AUTHORIZATION, "Bearer secret")

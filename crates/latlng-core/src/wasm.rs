@@ -687,6 +687,42 @@ impl BrowserLatLng {
         })
     }
 
+    /// Deletes up to `max` objects whose TTL has passed, returning the number
+    /// deleted and the same geofence `Del` events as an explicit delete.
+    /// There is no background sweep in the browser build; call this
+    /// periodically to reclaim memory.
+    pub fn expire_due(&self, max: u32) -> Result<JsValue, JsValue> {
+        let due = self
+            .inner
+            .due_expirations(super::now_millis(), max as usize);
+        let mut expired = 0_u32;
+        let mut events = Vec::new();
+        for (collection, id) in due {
+            let (_, _, webhook_jobs) = self
+                .inner
+                .preview_del_command_batch(&collection, &id)
+                .map_err(|error| JsValue::from_str(&error.to_string()))?;
+            if self
+                .inner
+                .del(&collection, &id)
+                .map_err(|error| JsValue::from_str(&error.to_string()))?
+            {
+                expired += 1;
+                events.extend(
+                    webhook_jobs
+                        .into_iter()
+                        .map(encode_wasm_webhook_enqueue)
+                        .map(|record| record.event),
+                );
+            }
+        }
+        to_js(&WasmMutationResponse {
+            ok: true,
+            result: expired,
+            events,
+        })
+    }
+
     pub fn expire(&self, collection: &str, id: &str, seconds: u32) -> Result<JsValue, JsValue> {
         self.inner
             .expire(collection, id, seconds)

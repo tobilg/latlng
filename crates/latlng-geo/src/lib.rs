@@ -31,6 +31,80 @@ pub enum GeoError {
     UnresolvedReference,
     #[error("invalid geometry: {0}")]
     InvalidGeometry(String),
+    #[error("invalid coordinates: {0}")]
+    InvalidCoordinates(String),
+}
+
+/// Checks that a latitude/longitude pair is finite and within
+/// [-90, 90] / [-180, 180].
+pub fn validate_lat_lon(lat: f64, lon: f64) -> Result<(), GeoError> {
+    if !lat.is_finite() || !(-90.0..=90.0).contains(&lat) {
+        return Err(GeoError::InvalidCoordinates(format!(
+            "latitude {lat} is outside [-90, 90]"
+        )));
+    }
+    if !lon.is_finite() || !(-180.0..=180.0).contains(&lon) {
+        return Err(GeoError::InvalidCoordinates(format!(
+            "longitude {lon} is outside [-180, 180]"
+        )));
+    }
+    Ok(())
+}
+
+/// Checks that a radius is finite and strictly positive.
+pub fn validate_meters(meters: f64) -> Result<(), GeoError> {
+    if meters.is_finite() && meters > 0.0 {
+        Ok(())
+    } else {
+        Err(GeoError::InvalidCoordinates(format!(
+            "radius {meters} must be a positive number of meters"
+        )))
+    }
+}
+
+fn validate_bearing(bearing: f64) -> Result<(), GeoError> {
+    if bearing.is_finite() && (0.0..=360.0).contains(&bearing) {
+        Ok(())
+    } else {
+        Err(GeoError::InvalidCoordinates(format!(
+            "bearing {bearing} is outside [0, 360]"
+        )))
+    }
+}
+
+/// Validates every position in a GeoJSON geometry, feature, or feature
+/// collection. Structural problems are left to the GeoJSON parser.
+fn validate_geojson_positions(value: &Value) -> Result<(), GeoError> {
+    let Value::Object(object) = value else {
+        return Ok(());
+    };
+    if let Some(coordinates) = object.get("coordinates") {
+        validate_position_tree(coordinates)?;
+    }
+    if let Some(geometry) = object.get("geometry") {
+        validate_geojson_positions(geometry)?;
+    }
+    for key in ["features", "geometries"] {
+        if let Some(Value::Array(items)) = object.get(key) {
+            for item in items {
+                validate_geojson_positions(item)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn validate_position_tree(value: &Value) -> Result<(), GeoError> {
+    let Value::Array(items) = value else {
+        return Ok(());
+    };
+    match items.as_slice() {
+        [Value::Number(lon), Value::Number(lat), ..] => validate_lat_lon(
+            lat.as_f64().unwrap_or(f64::NAN),
+            lon.as_f64().unwrap_or(f64::NAN),
+        ),
+        _ => items.iter().try_for_each(validate_position_tree),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
@@ -42,6 +116,27 @@ pub struct BoundingBox {
 }
 
 impl BoundingBox {
+    /// Checks that both corners are valid coordinates and that min <= max on
+    /// both axes. Antimeridian-crossing boxes (`min_lon > max_lon`) are
+    /// rejected rather than reinterpreted.
+    pub fn validate(&self) -> Result<(), GeoError> {
+        validate_lat_lon(self.min_lat, self.min_lon)?;
+        validate_lat_lon(self.max_lat, self.max_lon)?;
+        if self.min_lat > self.max_lat {
+            return Err(GeoError::InvalidCoordinates(format!(
+                "min_lat {} is greater than max_lat {}",
+                self.min_lat, self.max_lat
+            )));
+        }
+        if self.min_lon > self.max_lon {
+            return Err(GeoError::InvalidCoordinates(format!(
+                "min_lon {} is greater than max_lon {}; boxes crossing the antimeridian are not supported",
+                self.min_lon, self.max_lon
+            )));
+        }
+        Ok(())
+    }
+
     pub fn new(min_lat: f64, min_lon: f64, max_lat: f64, max_lon: f64) -> Self {
         Self {
             min_lat: min_lat.min(max_lat),
@@ -201,6 +296,16 @@ pub enum GeoType {
 }
 
 impl GeoType {
+    /// Checks coordinate ranges for stored objects.
+    pub fn validate(&self) -> Result<(), GeoError> {
+        match self {
+            Self::Point { lat, lon, .. } => validate_lat_lon(*lat, *lon),
+            Self::Bounds(bounds) => bounds.validate(),
+            Self::GeoJson(value) => validate_geojson_positions(value),
+            Self::Hash(_) | Self::String(_) => Ok(()),
+        }
+    }
+
     pub fn point(lat: f64, lon: f64) -> Self {
         Self::Point { lat, lon, z: None }
     }
@@ -304,6 +409,31 @@ pub enum Area {
 }
 
 impl Area {
+    /// Checks coordinate ranges, radii and bearings of a query or fence area.
+    pub fn validate(&self) -> Result<(), GeoError> {
+        match self {
+            Self::Circle { lat, lon, meters } => {
+                validate_lat_lon(*lat, *lon)?;
+                validate_meters(*meters)
+            }
+            Self::Bounds(bounds) => bounds.validate(),
+            Self::GeoJson(value) => validate_geojson_positions(value),
+            Self::Sector {
+                lat,
+                lon,
+                meters,
+                bearing1,
+                bearing2,
+            } => {
+                validate_lat_lon(*lat, *lon)?;
+                validate_meters(*meters)?;
+                validate_bearing(*bearing1)?;
+                validate_bearing(*bearing2)
+            }
+            Self::Hash(_) | Self::Tile { .. } | Self::Quadkey(_) | Self::Reference { .. } => Ok(()),
+        }
+    }
+
     pub fn envelope(&self) -> Result<BoundingBox, GeoError> {
         match self {
             Self::Circle { lat, lon, meters } => circle_envelope(*lat, *lon, *meters),
@@ -872,10 +1002,69 @@ fn geojson_value_to_geometry(value: &Value) -> Result<Geometry<f64>, GeoError> {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::{
         Area, BoundingBox, FieldMap, FieldValue, GeoType, decode_geohash_bbox, encode_geohash,
-        get_json_path, haversine_distance_meters, set_json_path,
+        get_json_path, haversine_distance_meters, set_json_path, validate_meters,
     };
+
+    #[test]
+    fn coordinate_validation_rejects_out_of_range_input() {
+        assert!(GeoType::point(53.55, 9.99).validate().is_ok());
+        assert!(GeoType::point(999.0, 9.99).validate().is_err());
+        assert!(GeoType::point(53.55, -720.0).validate().is_err());
+        assert!(GeoType::point(f64::NAN, 0.0).validate().is_err());
+        assert!(GeoType::point(90.0, 180.0).validate().is_ok());
+
+        let bbox = |min_lat, min_lon, max_lat, max_lon| BoundingBox {
+            min_lat,
+            min_lon,
+            max_lat,
+            max_lon,
+        };
+        assert!(bbox(50.0, 0.0, 60.0, 20.0).validate().is_ok());
+        assert!(bbox(60.0, 0.0, 50.0, 20.0).validate().is_err());
+        assert!(bbox(50.0, 20.0, 60.0, 0.0).validate().is_err());
+
+        let polygon = |lon: f64| {
+            GeoType::GeoJson(json!({
+                "type": "Feature",
+                "properties": {},
+                "geometry": {"type": "Polygon", "coordinates": [[[9.9, 53.5], [lon, 53.5], [9.96, 53.57], [9.9, 53.5]]]}
+            }))
+        };
+        assert!(polygon(9.96).validate().is_ok());
+        assert!(polygon(200.0).validate().is_err());
+        let collection = GeoType::GeoJson(json!({
+            "type": "FeatureCollection",
+            "features": [{"type": "Feature", "properties": {}, "geometry": {"type": "Point", "coordinates": [0.0, -91.0]}}]
+        }));
+        assert!(collection.validate().is_err());
+    }
+
+    #[test]
+    fn area_validation_checks_radius_and_bearings() {
+        let circle = |lat, meters| Area::Circle {
+            lat,
+            lon: 1.0,
+            meters,
+        };
+        assert!(circle(1.0, 10.0).validate().is_ok());
+        assert!(circle(1.0, -5.0).validate().is_err());
+        assert!(circle(1.0, 0.0).validate().is_err());
+        assert!(circle(200.0, 10.0).validate().is_err());
+        let sector = |bearing2: f64| Area::Sector {
+            lat: 1.0,
+            lon: 1.0,
+            meters: 10.0,
+            bearing1: 0.0,
+            bearing2,
+        };
+        assert!(sector(90.0).validate().is_ok());
+        assert!(sector(400.0).validate().is_err());
+        assert!(validate_meters(f64::INFINITY).is_err());
+    }
 
     #[test]
     fn point_envelope_is_degenerate_bounds() {

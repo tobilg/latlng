@@ -70,10 +70,7 @@ pub(crate) fn apply_persisted_command_to_state<P: Platform>(
         } => {
             if let Some(handle) = collection_handle_from_catalog::<P>(collections, &collection) {
                 let mut collection_state = P::write(&*handle);
-                if let Some(object) = collection_state.collection.objects.get_mut(&id) {
-                    for field in fields {
-                        object.fields.insert(field.name, field.value);
-                    }
+                if collection_state.collection.insert_fields(&id, &fields) {
                     collection_state.version = collection_state.version.saturating_add(1);
                 }
             }
@@ -85,9 +82,8 @@ pub(crate) fn apply_persisted_command_to_state<P: Platform>(
         } => {
             if let Some(handle) = collection_handle_from_catalog::<P>(collections, &collection) {
                 let mut collection_state = P::write(&*handle);
-                if let Some(object) = collection_state.collection.objects.get_mut(&id) {
-                    object.expires_at =
-                        Some(now_millis().saturating_add(u64::from(seconds) * 1_000));
+                let deadline = now_millis().saturating_add(u64::from(seconds) * 1_000);
+                if collection_state.collection.set_expiry(&id, Some(deadline)) {
                     collection_state.version = collection_state.version.saturating_add(1);
                 }
             }
@@ -111,8 +107,10 @@ pub(crate) fn apply_persisted_command_to_state<P: Platform>(
         } => {
             if let Some(handle) = collection_handle_from_catalog::<P>(collections, &collection) {
                 let mut collection_state = P::write(&*handle);
-                if let Some(object) = collection_state.collection.objects.get_mut(&id) {
-                    object.expires_at = Some(expires_at_ms);
+                if collection_state
+                    .collection
+                    .set_expiry(&id, Some(expires_at_ms))
+                {
                     collection_state.version = collection_state.version.saturating_add(1);
                 }
             }
@@ -123,8 +121,7 @@ pub(crate) fn apply_persisted_command_to_state<P: Platform>(
         Command::Persist { collection, id } => {
             if let Some(handle) = collection_handle_from_catalog::<P>(collections, &collection) {
                 let mut collection_state = P::write(&*handle);
-                if let Some(object) = collection_state.collection.objects.get_mut(&id) {
-                    object.expires_at = None;
+                if collection_state.collection.set_expiry(&id, None) {
                     collection_state.version = collection_state.version.saturating_add(1);
                 }
             }
@@ -150,6 +147,7 @@ pub(crate) fn apply_persisted_command_to_state<P: Platform>(
                         serde_json::Value::String(value)
                     };
                     let _ = set_json_path(json, &path, payload);
+                    collection_state.collection.reindex_spatial(&id);
                     collection_state.version = collection_state.version.saturating_add(1);
                 }
             }
@@ -168,6 +166,7 @@ pub(crate) fn apply_persisted_command_to_state<P: Platform>(
                     .map(|object| &mut object.geo)
                 {
                     let _ = delete_json_path(json, &path);
+                    collection_state.collection.reindex_spatial(&id);
                     collection_state.version = collection_state.version.saturating_add(1);
                 }
             }
@@ -177,7 +176,11 @@ pub(crate) fn apply_persisted_command_to_state<P: Platform>(
             endpoint,
             def,
         } => {
-            P::write(geofences).set_hook(name, endpoint, def);
+            if let Err(error) = ensure_geofence_evaluable(&def) {
+                tracing::warn!(hook = %name, %error, "skipping invalid hook definition from log");
+            } else {
+                P::write(geofences).set_hook(name, endpoint, def);
+            }
         }
         Command::DelHook { name } => {
             P::write(geofences).del_hook(&name);
@@ -186,7 +189,11 @@ pub(crate) fn apply_persisted_command_to_state<P: Platform>(
             P::write(geofences).pdel_hook(&pattern);
         }
         Command::SetChannel { name, def } => {
-            P::write(geofences).set_channel(name, def);
+            if let Err(error) = ensure_geofence_evaluable(&def) {
+                tracing::warn!(channel = %name, %error, "skipping invalid channel definition from log");
+            } else {
+                P::write(geofences).set_channel(name, def);
+            }
         }
         Command::DelChannel { name } => {
             P::write(geofences).del_channel(&name);

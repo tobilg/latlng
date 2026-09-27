@@ -34,6 +34,16 @@ On native AOF-backed servers, append requests are funneled through a dedicated w
 - `snapshot()` and `compact()` rewrite the file contents rather than appending tombstones forever
 - expirations are persisted as absolute deadlines in the primary log, so replay and `AOFSHRINK` preserve the original expiry instant instead of extending TTLs on restart
 - SQLite uses a transaction for `append_batch()`, so the same atomic batch guarantee applies there as well
+- replay loads existing objects and geofence definitions as they are; only hooks or channels whose area is a `Reference` (which could never be evaluated) are skipped with a warning
+
+## Expiry
+
+- objects with a TTL are tracked in a per-collection index ordered by deadline
+- on the leader, a background sweep runs every `expiry_sweep_interval_ms` (default `100`, `0` disables it; env `LATLNG_EXPIRY_SWEEP_INTERVAL_MS`, flag `--expiry-sweep-interval-ms`) and deletes due objects through the normal delete path, in batches of up to 10,000
+- each expiry is therefore appended to the log as a `Del`, replicated to followers, and emits `Del` geofence events; there is no separate expire event type
+- followers never expire objects themselves; they apply the leader's replicated deletes and hide expired objects from reads in the meantime
+- the sweep is skipped in read-only mode; `POST /admin/gc` still removes expired objects from memory without logging them
+- `latlng_expired_objects_total` counts objects deleted by the sweep
 
 ## Operational Guidance
 

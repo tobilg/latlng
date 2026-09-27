@@ -89,6 +89,22 @@ use utoipa::{OpenApi, ToSchema};
         NearbyRequest,
         AreaSearchRequest,
         SearchOptionsSchema,
+        SortOrderSchema,
+        OutputFormatSchema,
+        WhereComparisonSchema,
+        WhereFilterSchema,
+        WhereInFilterSchema,
+        WhereExprFilterSchema,
+        BoundingBoxSchema,
+        GeoJsonSchema,
+        AreaSchema,
+        GeoTypeSchema,
+        FieldValueSchema,
+        SetConditionSchema,
+        GeofenceDefSchema,
+        GeofenceQuerySchema,
+        DetectTypeSchema,
+        MutationCommandSchema,
         SearchResponse,
         SetChannelRequest,
         ChannelMutationResponse,
@@ -226,21 +242,102 @@ pub struct StatsResponse {
     pub stats: Value,
 }
 
+// The schema types below mirror the serde wire format of the engine types
+// (`latlng_index::SearchOptions`, `latlng_geo::Area`, and so on). They exist
+// only to document the API; keep them in sync with the real types.
+
+/// Typed field value, serialized as `{"type": "number" | "text" | "json", "value": ...}`.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[serde(tag = "type", content = "value", rename_all = "snake_case")]
+pub enum FieldValueSchema {
+    Number(f64),
+    Text(String),
+    Json(String),
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct FieldEntrySchema {
     pub name: String,
-    #[schema(value_type = Object)]
-    pub value: Value,
+    pub value: FieldValueSchema,
+}
+
+/// A GeoJSON geometry, feature, or feature collection (RFC 7946).
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+#[schema(value_type = Object)]
+pub struct GeoJsonSchema(Value);
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct BoundingBoxSchema {
+    pub min_lat: f64,
+    pub min_lon: f64,
+    pub max_lat: f64,
+    pub max_lon: f64,
+}
+
+/// Stored object geometry.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub enum GeoTypeSchema {
+    Point {
+        lat: f64,
+        lon: f64,
+        z: Option<f64>,
+    },
+    Bounds(BoundingBoxSchema),
+    Hash(String),
+    /// A GeoJSON geometry, feature, or feature collection.
+    GeoJson(GeoJsonSchema),
+    String(String),
+}
+
+/// Query or geofence area.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub enum AreaSchema {
+    Circle {
+        lat: f64,
+        lon: f64,
+        meters: f64,
+    },
+    Bounds(BoundingBoxSchema),
+    Hash(String),
+    /// A GeoJSON geometry, feature, or feature collection.
+    GeoJson(GeoJsonSchema),
+    Tile {
+        x: u32,
+        y: u32,
+        z: u32,
+    },
+    Quadkey(String),
+    Sector {
+        lat: f64,
+        lon: f64,
+        meters: f64,
+        bearing1: f64,
+        bearing2: f64,
+    },
+    /// Uses a stored object as the area. Search endpoints only; rejected in hooks and channels.
+    Reference {
+        collection: String,
+        id: String,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub enum SetConditionSchema {
+    Always,
+    Nx,
+    Xx,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SetObjectRequest {
-    #[schema(value_type = Object)]
-    pub object: Value,
+    pub object: GeoTypeSchema,
+    /// Fields to add or overwrite; existing fields not listed are kept. A
+    /// numeric `0` deletes the field.
     #[serde(default)]
     pub fields: Vec<FieldEntrySchema>,
+    /// TTL in seconds. Omitting it clears any existing TTL.
     pub expire_seconds: Option<u32>,
-    pub condition: Option<String>,
+    pub condition: Option<SetConditionSchema>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -269,6 +366,7 @@ pub struct DeleteCountResponse {
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct FsetRequest {
+    /// Fields to add or overwrite; a numeric `0` deletes the field.
     pub fields: Vec<FieldEntrySchema>,
     pub xx: Option<bool>,
 }
@@ -309,9 +407,67 @@ pub struct JsonValueResponse {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub enum SortOrderSchema {
+    Asc,
+    Desc,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub enum OutputFormatSchema {
+    Objects,
+    Points,
+    Bounds,
+    Hashes { precision: u8 },
+    Ids,
+    Count,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub enum WhereComparisonSchema {
+    Range { min: f64, max: f64 },
+    EqualsText(String),
+    Regex(String),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WhereFilterSchema {
+    pub field: String,
+    pub comparison: WhereComparisonSchema,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WhereInFilterSchema {
+    pub field: String,
+    pub values: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct WhereExprFilterSchema {
+    pub expression: String,
+}
+
+/// Search options. Every property is optional; unknown properties are rejected.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SearchOptionsSchema {
-    #[schema(value_type = Object)]
-    pub options: Value,
+    /// Result offset. Default `0`.
+    pub cursor: Option<u32>,
+    /// Maximum results. Default `100`.
+    pub limit: Option<u32>,
+    /// Omit fields from results. Default `false`.
+    pub nofields: Option<bool>,
+    /// Include the total match count. Default `true`.
+    pub include_count: Option<bool>,
+    /// Glob pattern matched against object ids.
+    pub match_pattern: Option<String>,
+    /// Sort order by id. Default `Asc`.
+    pub sort: Option<SortOrderSchema>,
+    pub where_filters: Option<Vec<WhereFilterSchema>>,
+    pub where_in_filters: Option<Vec<WhereInFilterSchema>>,
+    pub where_expr_filters: Option<Vec<WhereExprFilterSchema>>,
+    /// Clip geometries to the query area. Default `false`.
+    pub clip: Option<bool>,
+    /// Result projection. Default `Objects`.
+    pub output: Option<OutputFormatSchema>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -319,18 +475,66 @@ pub struct NearbyRequest {
     pub lat: f64,
     pub lon: f64,
     pub meters: f64,
-    #[serde(default)]
-    #[schema(value_type = Object)]
-    pub options: Value,
+    pub options: Option<SearchOptionsSchema>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct AreaSearchRequest {
-    #[schema(value_type = Object)]
-    pub area: Value,
-    #[serde(default)]
-    #[schema(value_type = Object)]
-    pub options: Value,
+    pub area: AreaSchema,
+    pub options: Option<SearchOptionsSchema>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub enum DetectTypeSchema {
+    Inside,
+    Outside,
+    Enter,
+    Exit,
+    Cross,
+    Roam,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub enum MutationCommandSchema {
+    Set,
+    Del,
+    Drop,
+    Fset,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub enum GeofenceQuerySchema {
+    Nearby {
+        lat: f64,
+        lon: f64,
+        meters: f64,
+        options: SearchOptionsSchema,
+    },
+    Within {
+        area: AreaSchema,
+        options: SearchOptionsSchema,
+    },
+    Intersects {
+        area: AreaSchema,
+        options: SearchOptionsSchema,
+    },
+    Roam {
+        target_collection: String,
+        target_pattern: String,
+        meters: f64,
+        options: SearchOptionsSchema,
+        nodwell: bool,
+    },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
+pub struct GeofenceDefSchema {
+    pub collection: String,
+    pub query: GeofenceQuerySchema,
+    /// Detection types to emit. Empty means all.
+    pub detect: Vec<DetectTypeSchema>,
+    /// Mutation commands to react to. Empty means all.
+    pub commands: Vec<MutationCommandSchema>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -342,8 +546,7 @@ pub struct SearchResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SetChannelRequest {
     pub name: String,
-    #[schema(value_type = Object)]
-    pub def: Value,
+    pub def: GeofenceDefSchema,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -361,16 +564,14 @@ pub struct ChannelsResponse {
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct ChannelDefResponse {
     pub name: String,
-    #[schema(value_type = Object)]
-    pub def: Value,
+    pub def: GeofenceDefSchema,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
 pub struct SetHookRequest {
     pub name: String,
     pub endpoint: String,
-    #[schema(value_type = Object)]
-    pub def: Value,
+    pub def: GeofenceDefSchema,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -389,8 +590,7 @@ pub struct HooksResponse {
 pub struct HookDefResponse {
     pub name: String,
     pub endpoint: String,
-    #[schema(value_type = Object)]
-    pub def: Value,
+    pub def: GeofenceDefSchema,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, ToSchema)]
@@ -505,7 +705,7 @@ fn collection_stats() {}
 #[utoipa::path(post, path = "/collections/{collection}/objects/{id}", tag = "objects", params(("collection" = String, Path, description = "Collection name."), ("id" = String, Path, description = "Object id.")), request_body = SetObjectRequest, responses((status = 200, description = "Object write result", body = SetObjectResponse)))]
 fn object_set() {}
 
-#[utoipa::path(get, path = "/collections/{collection}/objects/{id}", tag = "objects", params(("collection" = String, Path, description = "Collection name."), ("id" = String, Path, description = "Object id."), ("with_fields" = Option<bool>, Query, description = "Include fields."), ("format" = Option<String>, Query, description = "Projection format."), ("hash_precision" = Option<u8>, Query, description = "Geohash precision when format=hashes.")), responses((status = 200, description = "Object payload or null", body = GetObjectResponse)))]
+#[utoipa::path(get, path = "/collections/{collection}/objects/{id}", tag = "objects", params(("collection" = String, Path, description = "Collection name."), ("id" = String, Path, description = "Object id."), ("with_fields" = Option<bool>, Query, description = "Include fields."), ("format" = Option<String>, Query, description = "Projection format."), ("hash_precision" = Option<u8>, Query, description = "Geohash precision when format=hashes.")), responses((status = 200, description = "Object payload", body = GetObjectResponse), (status = 404, description = "Object or collection was not found", body = ErrorResponse)))]
 fn object_get() {}
 
 #[utoipa::path(delete, path = "/collections/{collection}/objects/{id}", tag = "objects", params(("collection" = String, Path, description = "Collection name."), ("id" = String, Path, description = "Object id.")), responses((status = 200, description = "Object deletion status", body = DeleteResponse)))]
@@ -529,10 +729,10 @@ fn object_persist() {}
 #[utoipa::path(get, path = "/collections/{collection}/objects/{id}/ttl", tag = "objects", params(("collection" = String, Path, description = "Collection name."), ("id" = String, Path, description = "Object id.")), responses((status = 200, description = "Object TTL", body = TtlResponse)))]
 fn object_ttl() {}
 
-#[utoipa::path(post, path = "/collections/{collection}/objects/{id}/json", tag = "objects", params(("collection" = String, Path, description = "Collection name."), ("id" = String, Path, description = "Object id.")), request_body = JsetRequest, responses((status = 200, description = "JSON mutation status", body = OkResponse)))]
+#[utoipa::path(post, path = "/collections/{collection}/objects/{id}/json", tag = "objects", params(("collection" = String, Path, description = "Collection name."), ("id" = String, Path, description = "Object id.")), request_body = JsetRequest, responses((status = 200, description = "JSON mutation status", body = OkResponse), (status = 400, description = "Object is not a GeoJSON object", body = ErrorResponse)))]
 fn object_json_set() {}
 
-#[utoipa::path(get, path = "/collections/{collection}/objects/{id}/json/{path}", tag = "objects", params(("collection" = String, Path, description = "Collection name."), ("id" = String, Path, description = "Object id."), ("path" = String, Path, description = "JSON path.")), responses((status = 200, description = "JSON value", body = JsonValueResponse)))]
+#[utoipa::path(get, path = "/collections/{collection}/objects/{id}/json/{path}", tag = "objects", params(("collection" = String, Path, description = "Collection name."), ("id" = String, Path, description = "Object id."), ("path" = String, Path, description = "JSON path.")), responses((status = 200, description = "JSON value, or null when the object or path does not exist", body = JsonValueResponse), (status = 400, description = "Object is not a GeoJSON object", body = ErrorResponse)))]
 fn object_json_get() {}
 
 #[utoipa::path(delete, path = "/collections/{collection}/objects/{id}/json/{path}", tag = "objects", params(("collection" = String, Path, description = "Collection name."), ("id" = String, Path, description = "Object id."), ("path" = String, Path, description = "JSON path.")), responses((status = 200, description = "JSON deletion status", body = DeleteResponse)))]

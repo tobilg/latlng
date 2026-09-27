@@ -670,8 +670,13 @@ export function toWireSearchOptions(options: SearchOptions | undefined): unknown
       field: filter.field,
       comparison: toWireWhereComparison(filter.comparison),
     })),
-    where_in_filters: value.whereInFilters ?? [],
-    where_expr_filters: value.whereExprFilters ?? [],
+    where_in_filters: (value.whereInFilters ?? []).map((filter) => ({
+      field: filter.field,
+      values: filter.values,
+    })),
+    where_expr_filters: (value.whereExprFilters ?? []).map((filter) => ({
+      expression: filter.expression,
+    })),
     clip: value.clip ?? false,
     output: toWireOutputFormat(value.output),
   };

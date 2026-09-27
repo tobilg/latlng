@@ -36,7 +36,7 @@ mod tests {
     use tokio::time::timeout;
     use tokio_util::compat::{TokioAsyncReadCompatExt, TokioAsyncWriteCompatExt};
 
-    use super::{CapnpService, lat_lng};
+    use super::{CapnpService, lat_lng, rpc};
 
     #[tokio::test(flavor = "current_thread")]
     async fn capnp_service_handles_ping_server_and_async_events() {
@@ -249,6 +249,82 @@ mod tests {
                     Ok(_) => panic!("delete should be forbidden"),
                     Err(error) => assert!(error.to_string().contains("forbidden")),
                 }
+
+                server.abort();
+            })
+            .await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn capnp_responses_carry_error_codes() {
+        let local = LocalSet::new();
+        local
+            .run_until(async {
+                let db: LatLngNative<MemoryBackend> = LatLng::builder()
+                    .storage(MemoryBackend::new())
+                    .build()
+                    .unwrap();
+                db.set(SetRequest {
+                    collection: "fleet".to_owned(),
+                    id: "truck-1".to_owned(),
+                    object: GeoType::point(52.52, 13.405),
+                    fields: Vec::new(),
+                    expire_seconds: None,
+                    condition: SetCondition::Always,
+                })
+                .unwrap();
+                let service = CapnpService::new(Arc::new(db));
+                let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+                let addr = listener.local_addr().unwrap();
+                let server = tokio::task::spawn_local({
+                    let service = service.clone();
+                    async move {
+                        let _ = service
+                            .serve_listener(
+                                listener,
+                                AuthConfig::default().authenticator().unwrap(),
+                            )
+                            .await;
+                    }
+                });
+                let client = connect(addr).await;
+
+                let get = {
+                    let mut req = client.get_request();
+                    let mut payload = req.get().init_req();
+                    payload.set_collection("fleet");
+                    payload.set_id("ghost");
+                    req.send().promise.await.unwrap()
+                };
+                assert!(!get.get().unwrap().get_ok());
+                assert_eq!(
+                    get.get().unwrap().get_code().unwrap(),
+                    rpc::ErrorCode::NotFound
+                );
+
+                let mut expire = client.expire_request();
+                expire.get().set_collection("fleet");
+                expire.get().set_id("ghost");
+                expire.get().set_seconds(10);
+                let expire = expire.send().promise.await.unwrap();
+                let expire = expire.get().unwrap().get_resp().unwrap();
+                assert!(!expire.get_ok());
+                assert_eq!(expire.get_code().unwrap(), rpc::ErrorCode::NotFound);
+
+                let mut jset = client.jset_request();
+                jset.get().set_collection("fleet");
+                jset.get().set_id("truck-1");
+                jset.get().set_path("properties.name");
+                jset.get().set_value("x");
+                let jset = jset.send().promise.await.unwrap();
+                let jset = jset.get().unwrap().get_resp().unwrap();
+                assert!(!jset.get_ok());
+                assert_eq!(jset.get_code().unwrap(), rpc::ErrorCode::BadRequest);
+
+                let ping = client.ping_request().send().promise.await.unwrap();
+                let ping = ping.get().unwrap().get_resp().unwrap();
+                assert!(ping.get_ok());
+                assert_eq!(ping.get_code().unwrap(), rpc::ErrorCode::None);
 
                 server.abort();
             })

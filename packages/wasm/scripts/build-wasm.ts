@@ -316,7 +316,7 @@ function run(command: string, args: string[], cwd: string): void {
 
 function installHint(command: string): string {
   if (command === "wasm-bindgen") {
-    return "\nInstall wasm-bindgen-cli 0.2.106 and ensure wasm-bindgen is on PATH.";
+    return "\nInstall wasm-bindgen-cli 0.2.126 and ensure wasm-bindgen is on PATH.";
   }
   if (command === "wasm-opt") {
     return "\nInstall Binaryen and ensure wasm-opt is on PATH.";

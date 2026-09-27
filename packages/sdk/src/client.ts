@@ -277,6 +277,10 @@ export class LatLngClient {
   /**
    * Stores or updates a single object in a collection.
    *
+   * The geometry is replaced and fields are merged: fields given here are
+   * added or overwritten, other existing fields are kept, and a numeric `0`
+   * deletes a field. Omitting `expireSeconds` clears any existing TTL.
+   *
    * @param collection Collection name.
    * @param id Object identifier.
    * @param object Object payload.
@@ -340,14 +344,21 @@ export class LatLngClient {
     options?: GetObjectOptions,
   ): Promise<LatLngObject | null> {
     const output = outputFormatToQuery(options?.format);
-    return this.requestRead({
-      path: `${routes.object(collection, id)}${routesQuery({
-        with_fields: options?.withFields ?? false,
-        format: output.format,
-        hash_precision: output.hash_precision,
-      })}`,
-      parser: fromWireObject,
-    });
+    try {
+      return await this.requestRead({
+        path: `${routes.object(collection, id)}${routesQuery({
+          with_fields: options?.withFields ?? false,
+          format: output.format,
+          hash_precision: output.hash_precision,
+        })}`,
+        parser: fromWireObject,
+      });
+    } catch (error) {
+      if (error instanceof HttpError && error.status === 404) {
+        return null;
+      }
+      throw error;
+    }
   }
 
   /**
@@ -384,7 +395,8 @@ export class LatLngClient {
   }
 
   /**
-   * Updates one or more fields on an existing object.
+   * Updates one or more fields on an existing object, keeping its geometry
+   * and TTL. A numeric `0` deletes the field.
    *
    * @param collection Collection name.
    * @param id Object identifier.

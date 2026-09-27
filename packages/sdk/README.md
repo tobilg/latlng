@@ -287,6 +287,8 @@ The SDK exports typed error classes:
 | `LatLngError` | Base SDK error. |
 | `TimeoutError` | Request exceeded `timeoutMs`. |
 | `HttpError` | Non-success HTTP response with status and payload context. |
+| `BadRequestError` | `400` response: invalid geometry, coordinates, filter, or request field. Subclass of `HttpError`. |
+| `NotFoundError` | `404` response: missing collection, object, hook, or channel. Subclass of `HttpError`. `get()` and `getCollection()` return `null` instead of throwing. |
 | `AuthError` | Authentication or authorization failure. |
 | `ServerUnavailableError` | Server unavailable response. |
 

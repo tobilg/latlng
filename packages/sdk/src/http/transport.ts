@@ -1,7 +1,9 @@
 import { withBearerToken } from "../auth/token.js";
 import {
   AuthError,
+  BadRequestError,
   HttpError,
+  NotFoundError,
   ServerUnavailableError,
   TimeoutError,
 } from "../errors/index.js";
@@ -126,8 +128,14 @@ export class HttpTransport {
           ? payload
           : `request failed with status ${status}`;
     const options = { status, url, body: payload };
+    if (status === 400) {
+      return new BadRequestError(message, options);
+    }
     if (status === 401) {
       return new AuthError(message, options);
+    }
+    if (status === 404) {
+      return new NotFoundError(message, options);
     }
     if (status === 503) {
       return new ServerUnavailableError(message, options);

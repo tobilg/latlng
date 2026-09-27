@@ -15,7 +15,7 @@ use serde_json::Value;
 pub use error::HttpError;
 pub(crate) use error::json_error_response;
 pub use latlng_core as core;
-pub use metrics::RequestMetrics;
+pub use metrics::{EngineMetrics, RequestMetrics};
 pub use routes::{
     STABLE_HTTP_ROUTES, StableHttpRoute, apply_runtime_layers, apply_runtime_layers_with_context,
     router, stable_http_routes,
@@ -326,6 +326,76 @@ mod tests {
         );
     }
 
+    #[test]
+    fn openapi_scan_and_text_bodies_are_unwrapped_search_options() {
+        let spec = crate::openapi_spec();
+        let schemas = &spec["components"]["schemas"];
+        for path in [
+            "/collections/{collection}/search/scan",
+            "/collections/{collection}/search/text",
+        ] {
+            let reference =
+                spec["paths"][path]["post"]["requestBody"]["content"]["application/json"]["schema"]
+                    ["$ref"]
+                    .as_str()
+                    .unwrap();
+            let name = reference.rsplit('/').next().unwrap();
+            let properties = &schemas[name]["properties"];
+            assert!(properties["match_pattern"].is_object(), "{path}");
+            assert!(properties["where_filters"].is_object(), "{path}");
+            assert!(properties["options"].is_null(), "{path}");
+        }
+        let condition =
+            serde_json::to_string(&schemas["SetObjectRequest"]["properties"]["condition"]).unwrap();
+        assert!(condition.contains("SetConditionSchema"), "{condition}");
+        assert_eq!(
+            schemas["SetConditionSchema"]["enum"],
+            serde_json::json!(["Always", "Nx", "Xx"])
+        );
+        assert!(schemas["SetHookRequest"]["properties"]["def"]["$ref"].is_string());
+    }
+
+    #[tokio::test]
+    async fn scan_filters_apply_and_wrapped_options_are_rejected() {
+        let app = app(AuthConfig::default());
+        for id in ["truck-1", "truck-2", "van-7"] {
+            let (status, _) = send_json(
+                &app,
+                "POST",
+                &format!("/collections/fleet/objects/{id}"),
+                Some(serde_json::json!({"object": {"Point": {"lat": 1.0, "lon": 1.0, "z": null}}})),
+            )
+            .await;
+            assert_eq!(status, StatusCode::OK);
+        }
+
+        let (status, body) = send_json(
+            &app,
+            "POST",
+            "/collections/fleet/search/scan",
+            Some(serde_json::json!({"match_pattern": "truck-*", "output": "Count"})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["count"], 2);
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/collections/fleet/search/scan")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(json_body(&serde_json::json!({
+                        "options": {"match_pattern": "truck-*", "output": "Count"}
+                    })))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert!(response.status().is_client_error(), "{}", response.status());
+    }
+
     #[tokio::test]
     async fn diagnostic_test_route_is_not_publicly_routed() {
         let app = app(AuthConfig::default());
@@ -509,6 +579,222 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing_hook.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn reference_area_fences_are_rejected_with_400() {
+        let app = app(AuthConfig::default());
+        let def = serde_json::json!({
+            "collection": "fleet",
+            "query": {"Within": {"area": {"Reference": {"collection": "zones", "id": "z1"}}, "options": {}}},
+            "detect": ["Enter"],
+            "commands": ["Set"]
+        });
+        let (status, body) = send_json(
+            &app,
+            "POST",
+            "/hooks",
+            Some(
+                serde_json::json!({"name": "ref", "endpoint": "http://127.0.0.1:9/x", "def": def}),
+            ),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+        assert!(body["error"].as_str().unwrap().contains("reference areas"));
+
+        let (status, _) = send_json(
+            &app,
+            "POST",
+            "/channels",
+            Some(serde_json::json!({"name": "ref", "def": def})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+
+        let (status, _) = send_json(
+            &app,
+            "POST",
+            "/collections/fleet/objects/v1",
+            Some(serde_json::json!({"object": {"Point": {"lat": 10.0, "lon": 10.0, "z": null}}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn client_errors_map_to_4xx_with_json_bodies() {
+        let app = app(AuthConfig::default());
+        let point = serde_json::json!({"object": {"Point": {"lat": 1.0, "lon": 1.0, "z": null}}});
+        let (status, _) = send_json(
+            &app,
+            "POST",
+            "/collections/fleet/objects/truck-1",
+            Some(serde_json::json!({
+                "object": {"Point": {"lat": 1.0, "lon": 1.0, "z": null}},
+                "fields": [{"name": "driver", "value": {"type": "text", "value": "ann"}}]
+            })),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let cases = [
+            (
+                "POST",
+                "/collections/fleet/objects/ghost/fields",
+                Some(
+                    serde_json::json!({"fields": [{"name": "speed", "value": {"type": "number", "value": 1.0}}]}),
+                ),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "POST",
+                "/collections/fleet/objects/ghost/expire",
+                Some(serde_json::json!({"seconds": 10})),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "POST",
+                "/collections/nope/search/nearby",
+                Some(serde_json::json!({"lat": 1.0, "lon": 1.0, "meters": 10.0})),
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "POST",
+                "/collections/fleet/search/scan",
+                Some(
+                    serde_json::json!({"where_filters": [{"field": "driver", "comparison": {"Regex": "(("}}]}),
+                ),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "POST",
+                "/collections/fleet/search/scan",
+                Some(serde_json::json!({"where_expr_filters": [{"expression": "nonsense"}]})),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "POST",
+                "/collections/fleet/objects/bad",
+                Some(
+                    serde_json::json!({"object": {"GeoJson": {"type": "Polygon", "coordinates": "x"}}}),
+                ),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "POST",
+                "/collections/fleet/objects/truck-1/json",
+                Some(serde_json::json!({"path": "properties.name", "value": "x"})),
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "GET",
+                "/collections/fleet/objects/truck-1/json/properties.name",
+                None,
+                StatusCode::BAD_REQUEST,
+            ),
+            (
+                "GET",
+                "/collections/fleet/objects/ghost",
+                None,
+                StatusCode::NOT_FOUND,
+            ),
+            (
+                "POST",
+                "/collections/fleet/objects/v1",
+                Some(
+                    serde_json::json!({"object": {"Point": {"lat": 1.0, "lon": 1.0, "z": null}}, "feilds": []}),
+                ),
+                StatusCode::BAD_REQUEST,
+            ),
+            ("GET", "/no/such/route", None, StatusCode::NOT_FOUND),
+            ("PATCH", "/ping", None, StatusCode::METHOD_NOT_ALLOWED),
+        ];
+        for (method, uri, body, expected) in cases {
+            let (status, json) = send_json(&app, method, uri, body).await;
+            assert_eq!(status, expected, "{method} {uri}: {json}");
+            let error = json["error"].as_str().unwrap_or_default();
+            assert!(!error.is_empty(), "{method} {uri}: {json}");
+            assert!(
+                !error.starts_with("internal error"),
+                "{method} {uri}: {error}"
+            );
+        }
+
+        let malformed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/collections/fleet/objects/v1")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from("{not json"))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
+        assert!(response_json(malformed).await["error"].is_string());
+
+        let wrong_type = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/collections/fleet/objects/v1")
+                    .body(json_body(&point))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(wrong_type.status(), StatusCode::UNSUPPORTED_MEDIA_TYPE);
+        assert!(response_json(wrong_type).await["error"].is_string());
+    }
+
+    #[tokio::test]
+    async fn invalid_coordinates_and_query_parameters_return_400() {
+        let app = app(AuthConfig::default());
+        let (status, _) = send_json(
+            &app,
+            "POST",
+            "/collections/geo/objects/ok",
+            Some(serde_json::json!({"object": {"Point": {"lat": 53.55, "lon": 9.99, "z": null}}})),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+
+        let cases = [
+            (
+                "/collections/geo/objects/badlat",
+                serde_json::json!({"object": {"Point": {"lat": 999.0, "lon": 9.99, "z": null}}}),
+            ),
+            (
+                "/collections/geo/objects/badlon",
+                serde_json::json!({"object": {"Point": {"lat": 53.55, "lon": -720.0, "z": null}}}),
+            ),
+            (
+                "/collections/geo/search/nearby",
+                serde_json::json!({"lat": 200.0, "lon": 9.99, "meters": 10.0}),
+            ),
+            (
+                "/collections/geo/search/nearby",
+                serde_json::json!({"lat": 53.55, "lon": 9.99, "meters": -5.0}),
+            ),
+            (
+                "/collections/geo/search/within",
+                serde_json::json!({"area": {"Bounds": {"min_lat": 60.0, "min_lon": 20.0, "max_lat": 50.0, "max_lon": 0.0}}}),
+            ),
+            (
+                "/collections/geo/search/intersects",
+                serde_json::json!({"area": {"Circle": {"lat": 53.55, "lon": 9.99, "meters": 0.0}}}),
+            ),
+        ];
+        for (uri, body) in cases {
+            let (status, json) = send_json(&app, "POST", uri, Some(body.clone())).await;
+            assert_eq!(status, StatusCode::BAD_REQUEST, "{uri} {body}: {json}");
+        }
+
+        let (_, bounds) = send_json(&app, "GET", "/collections/geo/bounds", None).await;
+        assert_eq!(bounds["bounds"]["max_lat"], 53.55);
     }
 
     #[tokio::test]
@@ -940,6 +1226,36 @@ mod tests {
             .oneshot(request.body(Body::empty()).unwrap())
             .await
             .unwrap()
+    }
+
+    async fn send_json(
+        app: &axum::Router,
+        method: &str,
+        uri: &str,
+        body: Option<serde_json::Value>,
+    ) -> (StatusCode, serde_json::Value) {
+        let request = Request::builder().method(method).uri(uri);
+        let request = match body {
+            Some(body) => request
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(json_body(&body))
+                .unwrap(),
+            None => request.body(Body::empty()).unwrap(),
+        };
+        let response = app.clone().oneshot(request).await.unwrap();
+        let status = response.status();
+        let bytes = to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let json = if bytes.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice(&bytes).unwrap_or_else(|_| {
+                panic!(
+                    "{method} {uri} returned non-JSON body: {}",
+                    String::from_utf8_lossy(&bytes)
+                )
+            })
+        };
+        (status, json)
     }
 
     fn json_body(value: &serde_json::Value) -> Body {

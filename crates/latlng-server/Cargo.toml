@@ -13,6 +13,7 @@ axum.workspace = true
 bincode.workspace = true
 capnp.workspace = true
 capnp-rpc.workspace = true
+clap.workspace = true
 latlng-auth = { path = "../latlng-auth" }
 latlng-capnp = { path = "../latlng-capnp" }
 latlng-config = { path = "../latlng-config" }

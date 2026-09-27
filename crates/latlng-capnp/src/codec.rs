@@ -8,11 +8,27 @@ use latlng_core::index::{
 use latlng_core::{FieldEntry, NearbyQuery, ServerInfo, SetCondition, SetRequest};
 use serde::Serialize;
 
+use crate::error::ErrorCodeOf;
 use crate::rpc;
 
 pub(crate) fn fill_ok_response(mut builder: rpc::ok_response::Builder<'_>, ok: bool, error: &str) {
     builder.set_ok(ok);
     builder.set_error(error);
+    builder.set_code(rpc::ErrorCode::None);
+}
+
+pub(crate) fn fill_ok_failure(
+    mut builder: rpc::ok_response::Builder<'_>,
+    code: rpc::ErrorCode,
+    error: &str,
+) {
+    builder.set_ok(false);
+    builder.set_error(error);
+    builder.set_code(code);
+}
+
+pub(crate) fn fill_ok_error(builder: rpc::ok_response::Builder<'_>, error: &impl ErrorCodeOf) {
+    fill_ok_failure(builder, error.error_code(), &error.to_string());
 }
 
 pub(crate) fn fill_bounds(mut builder: rpc::bounds::Builder<'_>, bounds: &BoundingBox) {
@@ -147,6 +163,7 @@ pub(crate) fn fill_search_response(
     builder.set_cursor(response.cursor);
     builder.set_count(response.count);
     builder.set_error("");
+    builder.set_code(rpc::ErrorCode::None);
     if search_response_is_ids_only(response) {
         let mut ids = builder.reborrow().init_ids(response.results.len() as u32);
         for (index, item) in response.results.iter().enumerate() {
@@ -165,11 +182,15 @@ pub(crate) fn fill_search_response(
     Ok(())
 }
 
-pub(crate) fn fill_search_error(mut builder: rpc::search_response::Builder<'_>, error: &str) {
+pub(crate) fn fill_search_error(
+    mut builder: rpc::search_response::Builder<'_>,
+    error: &impl ErrorCodeOf,
+) {
     builder.set_ok(false);
     builder.set_cursor(0);
     builder.set_count(0);
-    builder.set_error(error);
+    builder.set_error(error.to_string());
+    builder.set_code(error.error_code());
     let _ = builder.reborrow().init_results(0);
     let _ = builder.init_ids(0);
 }

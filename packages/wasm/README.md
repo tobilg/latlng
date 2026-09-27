@@ -123,7 +123,7 @@ Complete client method surface:
 | Lifecycle | `ready()`, `close()` |
 | Events | `addEventListener()`, `removeEventListener()`, `on()` |
 | Collections | `createCollection()`, `dropCollection()`, `collections()`, `collectionInfo()`, `bounds()`, `stats()` |
-| Objects | `setObject()`, `setPoint()`, `getObject()`, `deleteObject()`, `expire()`, `persist()`, `ttl()` |
+| Objects | `setObject()`, `setPoint()`, `getObject()`, `deleteObject()`, `expire()`, `persist()`, `ttl()`, `expireDue()` |
 | Queries | `nearby()`, `within()`, `intersects()`, `scan()`, `search()` |
 | Hooks | `setHook()`, `deleteHook()`, `hooks()`, `getHook()` |
 | Metadata | `serverInfo()` |
@@ -169,6 +169,14 @@ await db.deleteObject("fleet", "truck-1");
 ```
 
 `condition` can be `always`, `nx`, or `xx`.
+
+Expired objects are hidden from reads immediately, but the browser engine has no background
+sweep. Call `expireDue(max = 10000)` periodically to delete them; it returns how many objects
+were deleted and emits the same `Del` geofence events as `deleteObject()`:
+
+```ts
+setInterval(() => void db.expireDue(), 1_000);
+```
 `getObject()` accepts `{ withFields?: boolean }` and includes fields by default.
 Stored object shapes are `point`, `bounds`, `hash`, `geojson`, and `string`.
 Field values can be `number`, `text`, or `json`.

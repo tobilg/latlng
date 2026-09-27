@@ -1,8 +1,10 @@
 export { LatLngClient } from "./client.js";
 export {
   AuthError,
+  BadRequestError,
   HttpError,
   LatLngError,
+  NotFoundError,
   ServerUnavailableError,
   TimeoutError,
 } from "./errors/index.js";

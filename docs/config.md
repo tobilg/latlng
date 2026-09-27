@@ -1,7 +1,12 @@
 # latlng Configuration
 
 `latlng-server` reads JSON or TOML configuration from `--config` or `LATLNG_CONFIG`.
-Environment variables and explicit CLI flags override file values.
+Precedence is: built-in defaults < config file < environment variables < CLI flags.
+
+Run `latlng-server --help` for the full flag list. Flags accept both `--flag value` and
+`--flag=value`. Boolean flags such as `--capnp-enabled` may be given bare (meaning `true`)
+or with an explicit `true`/`false`. Unknown flags and malformed values are rejected with a
+non-zero exit instead of being ignored.
 
 Generate the machine-readable reference with:
 
@@ -93,13 +98,14 @@ Host-dependent defaults are shown symbolically.
 | `read_only` | `bool` | `false` | Rejects mutating commands when true. |
 | `command_timeouts` | `map<string,float>` | `{}` | Per-command timeout overrides in seconds. |
 | `subscriber_queue_capacity` | `usize` | `4096` | Per-subscriber event queue capacity. |
-| `webhook_queue_path` | `path|null` | `null` | SQLite webhook queue path. Defaults near the AOF or current directory. |
+| `webhook_queue_path` | `path|null` | `null` | SQLite webhook queue path. Defaults to the AOF path with a `.webhooks.sqlite` extension (for example `appendonly.webhooks.sqlite`); in memory storage mode the queue is kept in memory unless a path is set. |
 | `webhook_timeout_ms` | `u64` | `5000` | HTTP timeout for webhook deliveries. |
 | `webhook_concurrency_limit` | `usize` | `128` | Maximum concurrent webhook delivery attempts. |
 | `webhook_retry_count` | `u32` | `8` | Maximum webhook retry attempts before dead-lettering. |
 | `webhook_retry_initial_backoff_ms` | `u64` | `200` | Initial webhook retry backoff. |
 | `webhook_retry_max_backoff_ms` | `u64` | `30000` | Maximum webhook retry backoff. |
 | `webhook_lease_ms` | `u64` | `30000` | Webhook job lease duration. |
+| `expiry_sweep_interval_ms` | `u64` | `100` | How often the leader deletes objects whose TTL has passed. 0 disables the sweep. |
 | `native_executor_threads` | `usize` | `<available CPU parallelism>` | Native worker thread count for core operations. |
 | `native_executor_queue_limit` | `usize` | `<native_executor_threads * 64>` | Native executor queue limit. |
 | `aof_writer_queue_limit` | `usize` | `4096` | AOF writer queue limit. |

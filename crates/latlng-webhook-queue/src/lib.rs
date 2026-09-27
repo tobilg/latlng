@@ -58,6 +58,17 @@ impl WebhookQueue {
             std::fs::create_dir_all(parent).map_err(io_error)?;
         }
         let connection = Connection::open(&path).map_err(sql_error)?;
+        Self::initialize(path, connection)
+    }
+
+    /// Opens a queue that lives only in memory and is lost when the process
+    /// exits. Used when no durable location is configured.
+    pub fn open_in_memory() -> QueueResult<Self> {
+        let connection = Connection::open_in_memory().map_err(sql_error)?;
+        Self::initialize(PathBuf::from(":memory:"), connection)
+    }
+
+    fn initialize(path: PathBuf, connection: Connection) -> QueueResult<Self> {
         connection
             .execute_batch(
                 "PRAGMA journal_mode=WAL;
@@ -429,6 +440,17 @@ mod tests {
         WebhookRetryScheduledRecord,
     };
     use latlng_geofence::{DetectType, GeofenceEvent, MutationCommand};
+
+    #[test]
+    fn in_memory_queue_starts_empty_without_touching_disk() {
+        let queue = WebhookQueue::open_in_memory().unwrap();
+        let stats = queue.stats(0).unwrap();
+        assert_eq!(stats.pending, 0);
+        assert_eq!(stats.leased, 0);
+        assert_eq!(stats.dead_letter, 0);
+        queue.reset().unwrap();
+        assert!(!std::path::Path::new(":memory:").exists());
+    }
 
     #[test]
     fn queue_roundtrip_applies_enqueue_retry_and_ack() {

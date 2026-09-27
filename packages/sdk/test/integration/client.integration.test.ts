@@ -1,8 +1,10 @@
 import { afterEach, describe, expect, it } from "vitest";
 
 import {
+  BadRequestError,
   type GeofenceEvent,
   geojson,
+  NotFoundError,
   LatLngClient,
   point,
   ServerUnavailableError,
@@ -74,6 +76,15 @@ describe("latlng TypeScript SDK integration", () => {
     expect(nearby.results[0]?.id).toBe("truck-1");
 
     expect(await client.delete("fleet", "truck-1")).toBe(true);
+    await expect(client.get("fleet", "truck-1")).resolves.toBeNull();
+    await expect(
+      client.setFields("fleet", "ghost", { status: { type: "text", value: "idle" } }),
+    ).rejects.toBeInstanceOf(NotFoundError);
+    await expect(
+      client.scan("fleet", {
+        whereExprFilters: [{ expression: "nonsense" }],
+      }),
+    ).rejects.toBeInstanceOf(BadRequestError);
     await expect(client.getCollection("fleet")).resolves.toMatchObject({
       name: "fleet",
       stats: {

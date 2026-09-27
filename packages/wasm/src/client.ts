@@ -106,7 +106,11 @@ export class LatLngWasmClient {
     return (await this.#request("collectionInfo", collection)) as CollectionInfo | null;
   }
 
-  /** Stores or updates an object. */
+  /**
+   * Stores or updates an object. The geometry is replaced and fields are
+   * merged: given fields are added or overwritten, other existing fields are
+   * kept, and a numeric `0` deletes a field. Omitting a TTL clears it.
+   */
   public async setObject(
     collection: string,
     id: string,
@@ -162,6 +166,18 @@ export class LatLngWasmClient {
   /** Removes TTL metadata from an existing object. */
   public async persist(collection: string, id: string): Promise<boolean> {
     return Boolean(await this.#request("persist", collection, id));
+  }
+
+  /**
+   * Deletes up to `max` objects whose TTL has passed and returns how many were
+   * deleted. Matching hooks emit the same `Del` geofence events as an explicit
+   * delete. The browser engine has no background sweep; expired objects are
+   * hidden from reads immediately, and calling this periodically reclaims
+   * their memory and delivers the events.
+   */
+  public async expireDue(max = 10_000): Promise<number> {
+    const value = await this.#request("expireDue", max);
+    return typeof value === "number" ? value : 0;
   }
 
   /** Returns the remaining TTL in seconds, or `null` when no TTL is set or the object is missing. */

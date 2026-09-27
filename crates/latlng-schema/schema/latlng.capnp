@@ -191,6 +191,20 @@ struct RoamingGeofenceRequest {
 
 # Response Types
 
+# Machine-readable error classification carried next to the `error` text.
+# `none` means success, or a non-error negative result such as an unmet
+# set condition.
+enum ErrorCode {
+  none         @0;
+  notFound     @1;
+  badRequest   @2;
+  readOnly     @3;
+  internal     @4;
+  unauthorized @5;
+  forbidden    @6;
+  unavailable  @7;
+}
+
 struct SearchResult {
   id     @0 :Text;
   object @1 :GeoObject;
@@ -205,6 +219,7 @@ struct SearchResponse {
   count   @3 :UInt32;
   error   @4 :Text;
   ids     @5 :List(Text);
+  code    @6 :ErrorCode;
 }
 
 struct GeofenceEvent {
@@ -227,6 +242,7 @@ struct GeofenceEvent {
 struct OkResponse {
   ok    @0 :Bool;
   error @1 :Text;
+  code  @2 :ErrorCode;
 }
 
 struct ServerInfo {
@@ -263,7 +279,7 @@ struct BoundsResponse {
 
 interface LatLng {
   set          @0  (req :SetRequest) -> (resp :OkResponse);
-  get          @1  (req :GetRequest) -> (result :SearchResult, ok :Bool, error :Text);
+  get          @1  (req :GetRequest) -> (result :SearchResult, ok :Bool, error :Text, code :ErrorCode);
   del          @2  (collection :Text, id :Text) -> (resp :OkResponse);
   pdel         @3  (collection :Text, pattern :Text) -> (resp :OkResponse);
   drop         @4  (collection :Text) -> (resp :OkResponse);

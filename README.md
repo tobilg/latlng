@@ -185,6 +185,14 @@ latlng-cli readonly yes
 latlng-cli config-rewrite
 ```
 
+Object semantics worth knowing:
+
+- a `SET` replaces the object's geometry and **merges** its fields: fields in the request are added or overwritten, and fields not mentioned are kept, so a position-only update keeps all existing fields. The TTL is replaced: a `SET` without `expire_seconds` clears it.
+- setting a numeric field to `0` deletes it, in both `SET` and `POST …/fields`. A missing field reads as `0` in `where`, `where_in` and expression filters, so `0` and "absent" behave the same.
+- `POST …/fields` keeps the geometry and TTL; `expire` and `persist` keep the geometry and fields.
+- JSON-path edits (`jset`/`jget`/`jdel`) only apply to GeoJSON objects; other objects return `400`. A `jset` or `jdel` keeps the fields but clears the TTL.
+- expired objects are deleted by a background sweep on the leader (every `expiry_sweep_interval_ms`, default `100`). Each expiry goes through the normal delete path: it is written to the log, replicated to followers, and fires `Del` geofence events to hooks and channels whose `commands` include `Del`. Between sweeps, reads already hide expired objects.
+
 Hook and channel geofences can be created from GeoJSON files. The file may include `properties.collection`, `properties.detect`, `properties.commands`, and `properties.mode`; otherwise pass `--collection`, `--detect`, `--commands`, or `--mode` on the CLI.
 
 ```sh
@@ -215,6 +223,18 @@ curl -sS -X POST http://127.0.0.1:7421/collections/fleet/search/nearby \
   -H 'content-type: application/json' \
   -d '{"lat":52.52,"lon":13.405,"meters":500,"options":{}}'
 ```
+
+Every HTTP error response has a JSON body of the form `{"error": "..."}`:
+
+| Status | Meaning |
+| --- | --- |
+| `400` | Invalid request: malformed JSON, unknown request fields, invalid geometry, out-of-range coordinates, non-positive radius, inverted bounds, invalid regex or expression, JSON-path edits on non-GeoJSON objects, or read-only mode |
+| `401` / `403` | Missing or insufficient credentials |
+| `404` | The collection, object, hook, channel, or route does not exist (including `GET` of a missing object) |
+| `415` | Missing `content-type: application/json` |
+| `500` | Storage or internal failure |
+
+Request bodies reject unknown fields, so a misspelt key fails with `400` instead of being ignored. The scan and text-search endpoints take the search options object directly, for example `{"match_pattern":"truck-*","output":"Count"}`.
 
 Or use the TypeScript SDK:
 
@@ -388,13 +408,14 @@ The complete server config option set is:
 | `read_only` | `false` | Rejects mutating commands when true. |
 | `command_timeouts` | `{}` | Per-command timeout overrides in seconds. |
 | `subscriber_queue_capacity` | `4096` | Per-subscriber event queue capacity. |
-| `webhook_queue_path` | `null` | SQLite webhook queue path. Defaults near the AOF or current directory. |
+| `webhook_queue_path` | `null` | SQLite webhook queue path. Defaults to the AOF path with a `.webhooks.sqlite` extension (for example `appendonly.webhooks.sqlite`); in memory storage mode the queue is kept in memory unless a path is set. |
 | `webhook_timeout_ms` | `5000` | HTTP timeout for webhook deliveries. |
 | `webhook_concurrency_limit` | `128` | Maximum concurrent webhook delivery attempts. |
 | `webhook_retry_count` | `8` | Maximum webhook retry attempts before dead-lettering. |
 | `webhook_retry_initial_backoff_ms` | `200` | Initial webhook retry backoff. |
 | `webhook_retry_max_backoff_ms` | `30000` | Maximum webhook retry backoff. |
 | `webhook_lease_ms` | `30000` | Webhook job lease duration. |
+| `expiry_sweep_interval_ms` | `100` | How often the leader deletes objects whose TTL has passed. 0 disables the sweep. |
 | `native_executor_threads` | `<available CPU parallelism>` | Native worker thread count for core operations. |
 | `native_executor_queue_limit` | `<native_executor_threads * 64>` | Native executor queue limit. |
 | `aof_writer_queue_limit` | `4096` | AOF writer queue limit. |

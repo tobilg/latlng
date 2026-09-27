@@ -111,7 +111,7 @@ jobs:
 
       - name: Install wasm-bindgen CLI
         run: |
-          cargo install wasm-bindgen-cli --version 0.2.106 --locked
+          cargo install wasm-bindgen-cli --version 0.2.126 --locked
           wasm-bindgen --version
 
       - name: Install wasm-opt
@@ -503,7 +503,7 @@ jobs:
 
       - name: Install wasm-bindgen CLI
         run: |
-          cargo install wasm-bindgen-cli --version 0.2.106 --locked
+          cargo install wasm-bindgen-cli --version 0.2.126 --locked
           wasm-bindgen --version
 
       - name: Install wasm-opt

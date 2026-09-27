@@ -7,6 +7,7 @@ use latlng_core::{FieldEntry, GetOptions};
 use latlng_replication::ReplicationStatus;
 
 use crate::codec::*;
+use crate::error::{CallError, ErrorCodeOf};
 use crate::rpc_state::LatLngRpc;
 use crate::runtime::{
     apply_replication_to_server_info, rewrite_runtime_config, snapshot_replication_status,
@@ -31,7 +32,7 @@ where
         match stored {
             Ok(true) => fill_ok_response(out.init_resp(), true, ""),
             Ok(false) => fill_ok_response(out.init_resp(), false, "condition not met"),
-            Err(error) => fill_ok_response(out.init_resp(), false, &error.to_string()),
+            Err(error) => fill_ok_error(out.init_resp(), &error),
         }
         Ok(())
     }
@@ -61,16 +62,19 @@ where
                 fill_search_item_from_object(out.reborrow().init_result(), &object)?;
                 out.set_ok(true);
                 out.set_error("");
+                out.set_code(rpc::ErrorCode::None);
             }
             Ok(None) => {
                 fill_search_item(out.reborrow().init_result(), &empty_search_item(), false)?;
                 out.set_ok(false);
                 out.set_error("not found");
+                out.set_code(rpc::ErrorCode::NotFound);
             }
             Err(error) => {
                 fill_search_item(out.reborrow().init_result(), &empty_search_item(), false)?;
                 out.set_ok(false);
                 out.set_error(error.to_string());
+                out.set_code(error.error_code());
             }
         }
         Ok(())
@@ -91,8 +95,8 @@ where
         let out = results.get();
         match deleted {
             Ok(true) => fill_ok_response(out.init_resp(), true, ""),
-            Ok(false) => fill_ok_response(out.init_resp(), false, "not found"),
-            Err(error) => fill_ok_response(out.init_resp(), false, &error.to_string()),
+            Ok(false) => fill_ok_failure(out.init_resp(), rpc::ErrorCode::NotFound, "not found"),
+            Err(error) => fill_ok_error(out.init_resp(), &error),
         }
         Ok(())
     }
@@ -112,7 +116,7 @@ where
         let out = results.get();
         match result {
             Ok(_) => fill_ok_response(out.init_resp(), true, ""),
-            Err(error) => fill_ok_response(out.init_resp(), false, &error.to_string()),
+            Err(error) => fill_ok_error(out.init_resp(), &error),
         }
         Ok(())
     }
@@ -130,8 +134,8 @@ where
         let out = results.get();
         match dropped {
             Ok(true) => fill_ok_response(out.init_resp(), true, ""),
-            Ok(false) => fill_ok_response(out.init_resp(), false, "not found"),
-            Err(error) => fill_ok_response(out.init_resp(), false, &error.to_string()),
+            Ok(false) => fill_ok_failure(out.init_resp(), rpc::ErrorCode::NotFound, "not found"),
+            Err(error) => fill_ok_error(out.init_resp(), &error),
         }
         Ok(())
     }
@@ -152,7 +156,7 @@ where
         let out = results.get();
         match result {
             Ok(()) => fill_ok_response(out.init_resp(), true, ""),
-            Err(error) => fill_ok_response(out.init_resp(), false, &error.to_string()),
+            Err(error) => fill_ok_error(out.init_resp(), &error),
         }
         Ok(())
     }
@@ -174,7 +178,7 @@ where
         match result {
             Ok(true) => fill_ok_response(out.init_resp(), true, ""),
             Ok(false) => fill_ok_response(out.init_resp(), false, "destination already exists"),
-            Err(error) => fill_ok_response(out.init_resp(), false, &error.to_string()),
+            Err(error) => fill_ok_error(out.init_resp(), &error),
         }
         Ok(())
     }
@@ -196,8 +200,8 @@ where
         let out = results.get();
         match updated {
             Ok(true) => fill_ok_response(out.init_resp(), true, ""),
-            Ok(false) => fill_ok_response(out.init_resp(), false, "not found"),
-            Err(error) => fill_ok_response(out.init_resp(), false, &error.to_string()),
+            Ok(false) => fill_ok_failure(out.init_resp(), rpc::ErrorCode::NotFound, "not found"),
+            Err(error) => fill_ok_error(out.init_resp(), &error),
         }
         Ok(())
     }
@@ -247,7 +251,7 @@ where
         let out = results.get();
         match result {
             Ok(()) => fill_ok_response(out.init_resp(), true, ""),
-            Err(error) => fill_ok_response(out.init_resp(), false, &error.to_string()),
+            Err(error) => fill_ok_error(out.init_resp(), &error),
         }
         Ok(())
     }
@@ -267,7 +271,7 @@ where
         let out = results.get();
         match result {
             Ok(()) => fill_ok_response(out.init_resp(), true, ""),
-            Err(error) => fill_ok_response(out.init_resp(), false, &error.to_string()),
+            Err(error) => fill_ok_error(out.init_resp(), &error),
         }
         Ok(())
     }
@@ -436,7 +440,7 @@ where
         let out = results.get();
         match result {
             Ok(()) => fill_ok_response(out.init_resp(), true, ""),
-            Err(error) => fill_ok_response(out.init_resp(), false, &error.to_string()),
+            Err(error) => fill_ok_error(out.init_resp(), &error),
         }
         Ok(())
     }
@@ -484,8 +488,10 @@ where
         let out = results.get();
         match deleted {
             Ok(true) => fill_ok_response(out.init_resp(), true, ""),
-            Ok(false) => fill_ok_response(out.init_resp(), false, "path not found"),
-            Err(error) => fill_ok_response(out.init_resp(), false, &error.to_string()),
+            Ok(false) => {
+                fill_ok_failure(out.init_resp(), rpc::ErrorCode::NotFound, "path not found")
+            }
+            Err(error) => fill_ok_error(out.init_resp(), &error),
         }
         Ok(())
     }
@@ -504,7 +510,7 @@ where
         let out = results.get();
         match response {
             Ok(response) => fill_search_response(out.init_resp(), &response)?,
-            Err(error) => fill_search_error(out.init_resp(), &error.to_string()),
+            Err(error) => fill_search_error(out.init_resp(), &error),
         }
         Ok(())
     }
@@ -523,7 +529,7 @@ where
         let out = results.get();
         match response {
             Ok(response) => fill_search_response(out.init_resp(), &response)?,
-            Err(error) => fill_search_error(out.init_resp(), &error.to_string()),
+            Err(error) => fill_search_error(out.init_resp(), &error),
         }
         Ok(())
     }
@@ -542,7 +548,7 @@ where
         let out = results.get();
         match response {
             Ok(response) => fill_search_response(out.init_resp(), &response)?,
-            Err(error) => fill_search_error(out.init_resp(), &error.to_string()),
+            Err(error) => fill_search_error(out.init_resp(), &error),
         }
         Ok(())
     }
@@ -562,7 +568,7 @@ where
         let out = results.get();
         match response {
             Ok(response) => fill_search_response(out.init_resp(), &response)?,
-            Err(error) => fill_search_error(out.init_resp(), &error.to_string()),
+            Err(error) => fill_search_error(out.init_resp(), &error),
         }
         Ok(())
     }
@@ -582,7 +588,7 @@ where
         let out = results.get();
         match response {
             Ok(response) => fill_search_response(out.init_resp(), &response)?,
-            Err(error) => fill_search_error(out.init_resp(), &error.to_string()),
+            Err(error) => fill_search_error(out.init_resp(), &error),
         }
         Ok(())
     }
@@ -601,7 +607,7 @@ where
         let out = results.get();
         match result {
             Ok(()) => fill_ok_response(out.init_resp(), true, ""),
-            Err(error) => fill_ok_response(out.init_resp(), false, &error.to_string()),
+            Err(error) => fill_ok_error(out.init_resp(), &error),
         }
         Ok(())
     }
@@ -625,8 +631,8 @@ where
         let out = results.get();
         match deleted {
             Ok(true) => fill_ok_response(out.init_resp(), true, ""),
-            Ok(false) => fill_ok_response(out.init_resp(), false, "not found"),
-            Err(error) => fill_ok_response(out.init_resp(), false, &error.to_string()),
+            Ok(false) => fill_ok_failure(out.init_resp(), rpc::ErrorCode::NotFound, "not found"),
+            Err(error) => fill_ok_error(out.init_resp(), &error),
         }
         Ok(())
     }
@@ -663,7 +669,7 @@ where
         let out = results.get();
         match result {
             Ok(_) => fill_ok_response(out.init_resp(), true, ""),
-            Err(error) => fill_ok_response(out.init_resp(), false, &error.to_string()),
+            Err(error) => fill_ok_error(out.init_resp(), &error),
         }
         Ok(())
     }
@@ -767,7 +773,7 @@ where
         let out = results.get();
         match result {
             Ok(()) => fill_ok_response(out.init_resp(), true, ""),
-            Err(error) => fill_ok_response(out.init_resp(), false, &error.to_string()),
+            Err(error) => fill_ok_error(out.init_resp(), &error),
         }
         Ok(())
     }
@@ -791,8 +797,8 @@ where
         let out = results.get();
         match deleted {
             Ok(true) => fill_ok_response(out.init_resp(), true, ""),
-            Ok(false) => fill_ok_response(out.init_resp(), false, "not found"),
-            Err(error) => fill_ok_response(out.init_resp(), false, &error.to_string()),
+            Ok(false) => fill_ok_failure(out.init_resp(), rpc::ErrorCode::NotFound, "not found"),
+            Err(error) => fill_ok_error(out.init_resp(), &error),
         }
         Ok(())
     }
@@ -823,7 +829,7 @@ where
         let out = results.get();
         match result {
             Ok(_) => fill_ok_response(out.init_resp(), true, ""),
-            Err(error) => fill_ok_response(out.init_resp(), false, &error.to_string()),
+            Err(error) => fill_ok_error(out.init_resp(), &error),
         }
         Ok(())
     }
@@ -964,7 +970,11 @@ where
                 .await?;
                 fill_ok_response(out.init_resp(), true, "");
             }
-            _ => fill_ok_response(out.init_resp(), false, "unknown config key"),
+            _ => fill_ok_failure(
+                out.init_resp(),
+                rpc::ErrorCode::NotFound,
+                "unknown config key",
+            ),
         }
         Ok(())
     }
@@ -977,7 +987,11 @@ where
         self.ensure_global_action(AuthAction::AdminAll)?;
         match rewrite_runtime_config(self.runtime_config.as_ref()) {
             Ok(()) => fill_ok_response(results.get().init_resp(), true, ""),
-            Err(error) => fill_ok_response(results.get().init_resp(), false, &error.to_string()),
+            Err(error) => fill_ok_failure(
+                results.get().init_resp(),
+                rpc::ErrorCode::Internal,
+                &error.to_string(),
+            ),
         }
         Ok(())
     }
@@ -988,12 +1002,11 @@ where
         mut results: lat_lng::FlushdbResults,
     ) -> Result<(), capnp::Error> {
         self.ensure_global_action(AuthAction::AdminAll)?;
-        let result: Result<(), capnp::Error> = if let Some(coordinator) = &self.flushdb_coordinator
-        {
+        let result: Result<(), CallError> = if let Some(coordinator) = &self.flushdb_coordinator {
             coordinator
                 .flushdb()
                 .await
-                .map_err(|error| capnp::Error::failed(error.to_string()))
+                .map_err(|error| CallError::new(rpc::ErrorCode::Internal, error))
         } else {
             self.run_core_mutating(|db| db.flushdb()).await
         };
@@ -1010,7 +1023,7 @@ where
         let out = results.get();
         match result {
             Ok(()) => fill_ok_response(out.init_resp(), true, ""),
-            Err(error) => fill_ok_response(out.init_resp(), false, &error.to_string()),
+            Err(error) => fill_ok_error(out.init_resp(), &error),
         }
         Ok(())
     }
@@ -1064,11 +1077,19 @@ where
             }
             Err(AuthError::Unauthorized) => {
                 self.principal.replace(None);
-                fill_ok_response(out.init_resp(), false, "unauthorized");
+                fill_ok_failure(
+                    out.init_resp(),
+                    rpc::ErrorCode::Unauthorized,
+                    "unauthorized",
+                );
             }
             Err(error) => {
                 self.principal.replace(None);
-                fill_ok_response(out.init_resp(), false, &error.to_string());
+                fill_ok_failure(
+                    out.init_resp(),
+                    rpc::ErrorCode::Internal,
+                    &error.to_string(),
+                );
             }
         }
         Ok(())
@@ -1084,7 +1105,11 @@ where
         let command = read_text(params.get_command())?;
         let seconds = params.get_seconds();
         if command.trim().is_empty() {
-            fill_ok_response(results.get().init_resp(), false, "missing command");
+            fill_ok_failure(
+                results.get().init_resp(),
+                rpc::ErrorCode::BadRequest,
+                "missing command",
+            );
             return Ok(());
         }
         if seconds <= 0.0 {
@@ -1224,7 +1249,7 @@ where
         let out = results.get();
         match result {
             Ok(_) => fill_ok_response(out.init_resp(), true, ""),
-            Err(error) => fill_ok_response(out.init_resp(), false, &error.to_string()),
+            Err(error) => fill_ok_error(out.init_resp(), &error),
         }
         Ok(())
     }
